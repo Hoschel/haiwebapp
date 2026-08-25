@@ -1,19 +1,20 @@
 import { Router } from "express";
 import { createProject, deleteProject, getProject, getPublicProject, listProjects, publishProject, updateProjectFiles, patchProjectFiles } from "../controllers/projectController.js";
+import { getProjectVerification, reportRuntimeVerification } from "../controllers/verificationController.js";
 import { authMiddleware } from "../middleware/authMiddleware.js";
 import { chat } from "../controllers/chatController.js";
 
 const projectRouter = Router();
-
 projectRouter.get("/public/:id", getPublicProject);
 projectRouter.use(authMiddleware);
 projectRouter.post("/", createProject);
 projectRouter.get("/", listProjects);
+projectRouter.get("/:id/verification", getProjectVerification);
+projectRouter.post("/:id/verification/runtime", reportRuntimeVerification);
 projectRouter.get("/:id", getProject);
 projectRouter.delete("/:id", deleteProject);
 projectRouter.put("/:id/files", updateProjectFiles);
 projectRouter.patch("/:id/files", patchProjectFiles);
 projectRouter.post("/:id/publish", publishProject);
 projectRouter.post("/:id/chat", chat);
-
 export default projectRouter;
