@@ -1,101 +1,110 @@
 import { User } from "../models/User.js";
 import jwt from "jsonwebtoken";
 
-const JWT_SECRET = process.env.JWT_SECRET || "fallback_secret"
+function getJwtSecret() {
+    const secret = process.env.JWT_SECRET;
+    if (!secret || secret.length < 32) {
+        throw new Error("JWT_SECRET must be configured and contain at least 32 characters");
+    }
+    return secret;
+}
 
-// Helperto set cookie
-const setSessionCookie = (res, payload)=>{
-    const token = jwt.sign(payload, JWT_SECRET, {expiresIn: "30d"})
-    res.cookie('token', token, {
+const setSessionCookie = (res, payload) => {
+    const token = jwt.sign(payload, getJwtSecret(), { expiresIn: "30d" });
+
+    res.cookie("token", token, {
         httpOnly: true,
         secure: process.env.NODE_ENV === "production",
         sameSite: "lax",
-        maxAge: 30 * 24 * 60 * 60 * 1000, // 30 Days
+        maxAge: 30 * 24 * 60 * 60 * 1000,
         path: "/",
-    })
-}
+    });
+};
 
-export async function register(req, res){
-    const {name, email, password} = req.body
+export async function register(req, res) {
+    const { name, email, password } = req.body;
 
-    if(!name || !email || !password){
-        req.status(400).json({error: "Name, email and password are required."})
-        return;
+    if (!name || !email || !password) {
+        return res.status(400).json({ error: "Name, email and password are required." });
     }
-    const trimmedEmail = email.toLowerCase().trim();
-    const existing = await User.findOne({email: trimmedEmail})
-    if(existing){
-        req.status(400).json({error: "An account with this email already exists."})
-        return;
+
+    const trimmedName = String(name).trim();
+    const trimmedEmail = String(email).toLowerCase().trim();
+
+    if (!trimmedName || !trimmedEmail || String(password).length < 8) {
+        return res.status(400).json({
+            error: "Provide a valid name, email and a password of at least 8 characters.",
+        });
     }
+
+    const existing = await User.findOne({ email: trimmedEmail });
+    if (existing) {
+        return res.status(409).json({ error: "An account with this email already exists." });
+    }
+
     const user = await User.create({
-        name,
+        name: trimmedName,
         email: trimmedEmail,
-        password
-    })
+        password,
+    });
 
-    setSessionCookie(res, {userId: user._id.toString(), email: user.email})
+    setSessionCookie(res, { userId: user._id.toString(), email: user.email });
 
-    res.status(201).json({
+    return res.status(201).json({
         user: {
             _id: user._id,
             name: user.name,
-            email: user.email
-        }
-    })
+            email: user.email,
+        },
+    });
 }
 
-export async function login(req, res){
-        const { email, password} = req.body
+export async function login(req, res) {
+    const { email, password } = req.body;
 
-    if(!email || !password){
-        req.status(400).json({error: "Email and password are required."})
-        return;
-    }
-    const user = await User.findOne({email: email.toLowerCase().trim()})
-    if(!user){
-        req.status(401).json({error: "Invalid email or password"})
-        return;
+    if (!email || !password) {
+        return res.status(400).json({ error: "Email and password are required." });
     }
 
-    const isValid = await user.comparePassword(password)
-    if (!isValid) {
-        res.status(401).json({ error: "Invalid email or password" });
-        return;
+    const user = await User.findOne({
+        email: String(email).toLowerCase().trim(),
+    });
+
+    if (!user || !(await user.comparePassword(password))) {
+        return res.status(401).json({ error: "Invalid email or password" });
     }
 
-    setSessionCookie(res, {userId: user._id.toString(), email: user.email})
+    setSessionCookie(res, { userId: user._id.toString(), email: user.email });
 
-    res.status(201).json({
+    return res.status(200).json({
         user: {
             _id: user._id,
             name: user.name,
-            email: user.email
-        }
-    })
+            email: user.email,
+        },
+    });
 }
 
-export async function logout(_req, res){
-    res.cookie("token", "", {
+export async function logout(_req, res) {
+    res.clearCookie("token", {
         httpOnly: true,
         secure: process.env.NODE_ENV === "production",
         sameSite: "lax",
-        maxAge: 0,
         path: "/",
-    })
-    res.json({success: true})
+    });
+
+    res.json({ success: true });
 }
 
-export async function me(req, res){
-    if (!req.user){
-        res.status(401).json({error: "Not authenticated."})
-        return;
+export async function me(req, res) {
+    if (!req.user) {
+        return res.status(401).json({ error: "Not authenticated." });
     }
 
     const user = await User.findById(req.user.userId).select("-password");
-    if (!user){
-        res.status(404).json({error: "User not found."});
-        return;
+    if (!user) {
+        return res.status(404).json({ error: "User not found." });
     }
-    res.json({user})
+
+    return res.json({ user });
 }
