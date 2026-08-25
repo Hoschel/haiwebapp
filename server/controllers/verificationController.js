@@ -9,7 +9,7 @@ export async function getProjectVerification(req, res) {
     if (!req.user) return res.status(401).json({ error: "Unauthorized" });
     const project = await Project.findOne({ _id: req.params.id, owner: req.user.userId });
     if (!project) return res.status(404).json({ error: "Project not found" });
-    const verification = verifyProject(serializeFiles(project.files), project.verification?.runtime || {});
+    const verification = verifyProject(serializeFiles(project.files), project.verification?.runtime || {}, project.version);
     return res.json({ projectId: project._id, version: project.version, verification });
 }
 
@@ -20,7 +20,7 @@ export async function reportRuntimeVerification(req, res) {
     const project = await Project.findOne({ _id: req.params.id, owner: req.user.userId });
     if (!project) return res.status(404).json({ error: "Project not found" });
     const files = serializeFiles(project.files);
-    project.verification = withRuntimeVerification(files, project.verification, { status, error: status === "failed" ? String(error || "Runtime verification failed") : null });
+    project.verification = withRuntimeVerification(files, project.verification, { status, error: status === "failed" ? String(error || "Runtime verification failed") : null }, project.version);
     project.markModified("verification");
     await project.save();
     return res.json({ projectId: project._id, version: project.version, verification: project.verification });
