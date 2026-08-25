@@ -6,6 +6,7 @@ import { buildFileCodeSystem, FILE_PLAN_SYSTEM, REVISE_SYSTEM } from "./prompts.
 import { normalizeContent } from "./contentNormalizer.js";
 import { inspectGeneratedCode, validateAndFixCode, validateRevisionContent } from "./codeValidator.js";
 import { selectRelevantFiles } from "./fileRelevance.js";
+import { buildDependencyGraph, getAffectedFiles, getDependencyReport } from "./dependencyGraph.js";
 
 const MODEL = process.env.OPENROUTER_MODEL || "openrouter/free";
 const MAX_CONCURRENCY = Math.max(1, parseInt(process.env.AI_MAX_CONCURRENCY || "4", 10) || 4);
@@ -18,34 +19,19 @@ const model = openrouter(MODEL);
 
 async function generateSingleFile(file, allFiles, prompt, alreadyGeneratedFiles) {
     let repairContext = "";
-
     for (let attempt = 0; attempt <= MAX_GENERATION_REPAIRS; attempt += 1) {
         const system = buildFileCodeSystem(allFiles, alreadyGeneratedFiles);
-        const userMsg = [
-            `Project: ${prompt}`,
-            `Write the complete code for: ${file.path}`,
-            `Purpose: ${file.description}`,
-            repairContext,
-        ].filter(Boolean).join("\n\n");
-
-        console.log(`[AI] Creating file: ${file.path} (attempt ${attempt + 1}/${MAX_GENERATION_REPAIRS + 1})...`);
+        const userMsg = [`Project: ${prompt}`, `Write the complete code for: ${file.path}`, `Purpose: ${file.description}`, repairContext].filter(Boolean).join("\n\n");
         const { object } = await generateObject({ model, schema: FileCodeSchema, system, prompt: userMsg, maxRetries: 2 });
         let code = normalizeContent(object.code);
         if (!code.trim()) throw new Error("Generated code is empty after normalization");
-
         const validation = validateAndFixCode(code, file.path, { allPlannedFiles: allFiles });
         code = validation.code;
         const errors = inspectGeneratedCode(code, file.path, { allPlannedFiles: allFiles });
-
-        if (!errors.length) {
-            if (validation.warnings.length) console.log(`[Validator] ${file.path}: ${validation.warnings.join("; ")}`);
-            return { path: file.path, code };
-        }
-
+        if (!errors.length) return { path: file.path, code };
         if (attempt === MAX_GENERATION_REPAIRS) throw new Error(`Generated code failed validation: ${errors.join("; ")}`);
-        repairContext = `REPAIR REQUIRED. The previous output failed static validation. Fix ONLY these issues and regenerate the COMPLETE file:\n- ${errors.join("\n- ")}`;
+        repairContext = `REPAIR REQUIRED. Fix ONLY these issues and regenerate the COMPLETE file:\n- ${errors.join("\n- ")}`;
     }
-
     throw new Error("Generation repair loop exhausted");
 }
 
@@ -63,12 +49,11 @@ function createFallback(file) {
     if (path.endsWith(".css")) return `/* ${file.description || "Generation failed"} */\n`;
     const safeName = path.split("/").pop()?.replace(/\.[^.]+$/, "") || "Placeholder";
     const componentName = safeName.replace(/[^a-zA-Z0-9_$]/g, "") || "Placeholder";
-    return `import React from 'react';\n\n// This file could not be generated automatically.\nexport default function ${componentName}() {\n  return (\n    <div className='p-8 text-center text-zinc-400'>\n      <p>Component generation failed. Please retry.</p>\n    </div>\n  );\n}\n`;
+    return `import React from 'react';\n\nexport default function ${componentName}() {\n  return <div className='p-8 text-center text-zinc-400'>Component generation failed. Please retry.</div>;\n}\n`;
 }
 
 export async function generateProject(prompt, callbacks) {
     if (!process.env.OPENROUTER_API_KEY) throw new Error("OPENROUTER_API_KEY is not configured");
-
     const { object: plan } = await generateObject({ model, schema: FilePlanSchema, system: FILE_PLAN_SYSTEM, prompt: `Plan a React website for: ${prompt}`, maxRetries: 2 });
     if (!plan.files.find((file) => normalizePath(file.path) === "/App.js")) plan.files.unshift({ path: "/App.js", description: "Main application entry point", exports: "default App", imports: ["./styles.css"] });
     if (!plan.files.find((file) => normalizePath(file.path) === "/styles.css")) plan.files.push({ path: "/styles.css", description: "Global styles", exports: "none", imports: [] });
@@ -90,7 +75,7 @@ export async function generateProject(prompt, callbacks) {
             pendingFiles = [];
             for (const entry of results) {
                 if (entry.success) files[normalizePath(entry.result.path)] = entry.result.code;
-                else { console.warn(`[AI] ${entry.file.path} failed in round ${round}: ${entry.error?.message || entry.error}`); pendingFiles.push(entry.file); }
+                else pendingFiles.push(entry.file);
             }
         }
         for (const file of pendingFiles) {
@@ -99,14 +84,25 @@ export async function generateProject(prompt, callbacks) {
             if (callbacks?.onFileComplete) await callbacks.onFileComplete(path, files[path]);
         }
     }
-
     if (!files["/App.js"] && !files["/App.jsx"]) throw new Error("AI did not produce an application entry point");
-    return { files, description: plan.projectDescription };
+
+    const dependencyResult = buildDependencyGraph(files);
+    if (dependencyResult.unresolved.length) {
+        console.warn(`[AI] Generation produced ${dependencyResult.unresolved.length} unresolved local import(s).`, dependencyResult.unresolved);
+        if (callbacks?.onValidation) await callbacks.onValidation({ type: "dependency", report: getDependencyReport(dependencyResult) });
+    }
+    return { files, description: plan.projectDescription, dependencyReport: getDependencyReport(dependencyResult) };
 }
 
 export async function reviseProject(prompt, manifest, allFiles, recentMessages) {
+    const graphResult = buildDependencyGraph(allFiles);
     const selection = selectRelevantFiles(prompt, manifest, allFiles, { maxFiles: MAX_REVISION_FILES, maxCharacters: MAX_REVISION_CONTEXT });
-    const contextParts = ["## Current Project Files (manifest)", "```", ...manifest.map((file) => `${file.path} (${file.hash}, ${file.size}B)`), "```", "\n## Relevant File Contents", ...Object.entries(selection.files).map(([path, content]) => `\n### ${path}\n\`\`\`javascript\n${content}\n\`\`\``), `\n## Context Selection\nSelected ${Object.keys(selection.files).length} file(s), ${selection.characterCount} characters.`];
+    const selectedPaths = Object.keys(selection.files);
+    const affectedPaths = getAffectedFiles(graphResult, selectedPaths, { includeDependencies: true, includeDependents: true });
+    const contextPaths = [...new Set([...selectedPaths, ...affectedPaths])].filter((path) => allFiles[path]).slice(0, MAX_REVISION_FILES);
+    const contextFiles = Object.fromEntries(contextPaths.map((path) => [path, allFiles[path]]));
+
+    const contextParts = ["## Current Project Files (manifest)", "```", ...manifest.map((file) => `${file.path} (${file.hash}, ${file.size}B)`), "```", "\n## Relevant and Dependency-Affected Files", ...Object.entries(contextFiles).map(([path, content]) => `\n### ${path}\n\`\`\`javascript\n${content}\n\`\`\``), `\n## Dependency Report\n${JSON.stringify(getDependencyReport(graphResult))}`];
     if (recentMessages?.length) { contextParts.push("\n## Recent Conversation"); for (const message of recentMessages.slice(-3)) contextParts.push(`${message.role}: ${message.content}`); }
     contextParts.push(`\n## Revision Request\n${prompt}`);
 
