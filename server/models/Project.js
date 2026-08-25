@@ -13,15 +13,12 @@ const PlannedFileSchema = new Schema({
     imports: { type: [String], default: [] },
 }, { _id: false });
 
-const FileEntrySchema = new Schema({
-    content: { type: String, required: true },
-    hash: { type: String, required: true },
-}, { _id: false });
-
 const ProjectSchema = new Schema({
     name: { type: String, required: true, default: "Untitled Project", trim: true },
     description: { type: String, default: "" },
-    files: { type: Map, of: FileEntrySchema, default: {} },
+    // File paths contain dots (for example /App.js), so a Mixed object is used
+    // instead of a Mongoose Map whose keys cannot safely be addressed with dotted paths.
+    files: { type: Schema.Types.Mixed, default: {} },
     messages: { type: [MessageSchema], default: [] },
     version: { type: Number, default: 0, min: 0 },
     owner: { type: Schema.Types.ObjectId, ref: "User", required: true, index: true },
