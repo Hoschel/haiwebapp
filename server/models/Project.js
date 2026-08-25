@@ -22,6 +22,12 @@ const VerificationSchema = new Schema({
         unresolvedImports: { type: [Schema.Types.Mixed], default: [] },
         syntaxErrors: { type: [Schema.Types.Mixed], default: [] },
     },
+    build: {
+        status: { type: String, enum: ["passed", "failed"], default: "passed" },
+        entry: { type: String, default: null },
+        errors: { type: [Schema.Types.Mixed], default: [] },
+        warnings: { type: [Schema.Types.Mixed], default: [] },
+    },
     runtime: {
         status: { type: String, enum: ["pending", "passed", "failed"], default: "pending" },
         checkedAt: { type: Date, default: null },
@@ -58,9 +64,6 @@ function resetRuntimeVerification(update) {
     next["verification.runtime.version"] = null;
 }
 
-// Any code change creates a new project version and must invalidate the old
-// preview result. This also covers atomic findOneAndUpdate saves that bypass
-// document middleware.
 ProjectSchema.pre("save", function invalidateRuntime(next) {
     if (this.isModified("files") || this.isModified("version")) {
         const runtimeVersion = this.verification?.runtime?.version;
