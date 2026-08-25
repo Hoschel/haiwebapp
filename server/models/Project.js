@@ -26,6 +26,10 @@ const VerificationSchema = new Schema({
         status: { type: String, enum: ["pending", "passed", "failed"], default: "pending" },
         checkedAt: { type: Date, default: null },
         error: { type: String, default: null },
+        // Runtime results are only valid for the exact project version that
+        // produced them. Persisting this field prevents Mongoose from dropping
+        // it and accidentally treating stale preview results as current.
+        version: { type: Number, default: null, min: 0 },
     },
 }, { _id: false });
 
