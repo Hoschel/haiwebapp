@@ -26,9 +26,6 @@ const VerificationSchema = new Schema({
         status: { type: String, enum: ["pending", "passed", "failed"], default: "pending" },
         checkedAt: { type: Date, default: null },
         error: { type: String, default: null },
-        // Runtime results are only valid for the exact project version that
-        // produced them. Persisting this field prevents Mongoose from dropping
-        // it and accidentally treating stale preview results as current.
         version: { type: Number, default: null, min: 0 },
     },
 }, { _id: false });
@@ -50,6 +47,42 @@ const ProjectSchema = new Schema({
 }, {
     timestamps: true,
     optimisticConcurrency: true,
+});
+
+function resetRuntimeVerification(update) {
+    const next = update.$set || (update.$set = {});
+    next["verification.status"] = "pending_runtime";
+    next["verification.runtime.status"] = "pending";
+    next["verification.runtime.checkedAt"] = null;
+    next["verification.runtime.error"] = null;
+    next["verification.runtime.version"] = null;
+}
+
+// Any code change creates a new project version and must invalidate the old
+// preview result. This also covers atomic findOneAndUpdate saves that bypass
+// document middleware.
+ProjectSchema.pre("save", function invalidateRuntime(next) {
+    if (this.isModified("files") || this.isModified("version")) {
+        const runtimeVersion = this.verification?.runtime?.version;
+        if (runtimeVersion !== this.version) {
+            this.verification.status = "pending_runtime";
+            this.verification.runtime.status = "pending";
+            this.verification.runtime.checkedAt = null;
+            this.verification.runtime.error = null;
+            this.verification.runtime.version = null;
+            this.markModified("verification");
+        }
+    }
+    next();
+});
+
+ProjectSchema.pre(["findOneAndUpdate", "updateOne", "updateMany"], function invalidateRuntimeForAtomicUpdate(next) {
+    const update = this.getUpdate() || {};
+    const changesFiles = Boolean(update.$set?.files || update.files);
+    const changesVersion = Boolean(update.$inc?.version || update.$set?.version || update.version);
+    if (changesFiles || changesVersion) resetRuntimeVerification(update);
+    this.setUpdate(update);
+    next();
 });
 
 ProjectSchema.index({ owner: 1, updatedAt: -1 });
