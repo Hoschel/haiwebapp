@@ -1,16 +1,32 @@
 import jwt from "jsonwebtoken";
 
-export function authMiddleware(req, res, next){
-    const token = req.cookies.token;
-
-    if(!token){
-        return res.status(401).json({error: "Access denied. No session token provided."});
+function getJwtSecret() {
+    const secret = process.env.JWT_SECRET;
+    if (!secret || secret.length < 32) {
+        throw new Error("JWT_SECRET must be configured and contain at least 32 characters");
     }
+    return secret;
+}
+
+export function authMiddleware(req, res, next) {
+    const token = req.cookies?.token;
+
+    if (!token) {
+        return res.status(401).json({
+            error: "Access denied. No session token provided.",
+        });
+    }
+
     try {
-        const decoded = jwt.verify(token, process.env.JWT_SECRET || 'fallback_secret');
-        req.user = decoded;
-        next()
-    } catch (err){
-        res.status(401).json({error: "Session expired or invalid. Please sign in again."});
+        req.user = jwt.verify(token, getJwtSecret());
+        return next();
+    } catch (err) {
+        if (err.message?.startsWith("JWT_SECRET must be configured")) {
+            return next(err);
+        }
+
+        return res.status(401).json({
+            error: "Session expired or invalid. Please sign in again.",
+        });
     }
 }
