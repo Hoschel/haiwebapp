@@ -22,23 +22,13 @@ const BuilderPage = () => {
   const [publishUrl, setPublishUrl] = useState(null);
   const [repairPhase, setRepairPhase] = useState(null);
   const repairTimerRef = useRef(null);
-
   const { activeProject, loadingActiveProject, activeFile, showCode, setActiveFile, setShowCode, loadProject, logout, chatLoading, handleChat, saveState, runtimeError, repairingRuntime, runtimeRepairCount } = useAppContext();
 
   useEffect(() => { if (id) loadProject(id); }, [id, loadProject]);
-
   useEffect(() => {
     if (repairTimerRef.current) clearTimeout(repairTimerRef.current);
-    if (repairingRuntime) {
-      setRepairPhase("analyzing");
-      repairTimerRef.current = setTimeout(() => setRepairPhase("locating"), 350);
-      return;
-    }
-    if (runtimeRepairCount > 0 && !runtimeError) {
-      setRepairPhase("verifying");
-      repairTimerRef.current = setTimeout(() => setRepairPhase("fixed"), 600);
-      return;
-    }
+    if (repairingRuntime) { setRepairPhase("analyzing"); repairTimerRef.current = setTimeout(() => setRepairPhase("locating"), 350); return; }
+    if (runtimeRepairCount > 0 && !runtimeError) { setRepairPhase("verifying"); repairTimerRef.current = setTimeout(() => setRepairPhase("fixed"), 600); return; }
     if (runtimeRepairCount >= 2 && runtimeError) { setRepairPhase("failed"); return; }
     setRepairPhase(null);
   }, [repairingRuntime, runtimeRepairCount, runtimeError]);
@@ -61,7 +51,7 @@ const BuilderPage = () => {
 
   return (
     <div className='h-screen flex flex-col bg-white overflow-hidden text-zinc-900 relative'>
-      <BuilderHeader projectName={activeProject.name} version={activeProject.version} saveState={saveState} status={activeProject.status} showCode={showCode} publishing={publishing} onToggleShowCode={() => setShowCode(!showCode)} onOpenPreview={handleOpenPreview} onPublish={handlePublish} onDownload={handleDownload} onBack={() => navigate("/")} onLogout={logout} />
+      <BuilderHeader projectName={activeProject.name} projectId={activeProject._id} version={activeProject.version} saveState={saveState} status={activeProject.status} showCode={showCode} publishing={publishing} onToggleShowCode={() => setShowCode(!showCode)} onOpenPreview={handleOpenPreview} onPublish={handlePublish} onDownload={handleDownload} onBack={() => navigate("/")} onLogout={logout} />
       <div className='flex-1 flex overflow-hidden'>
         <div className='w-[320px] shrink-0 flex flex-col border-r border-zinc-200 bg-white'>
           <div className='flex border-b border-zinc-100'>
