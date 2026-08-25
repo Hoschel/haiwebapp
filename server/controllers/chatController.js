@@ -1,3 +1,4 @@
+import crypto from "crypto";
 import { Project } from "../models/Project.js";
 import { reviseProject } from "../services/ai.js";
 
@@ -5,26 +6,25 @@ function hashContent(content) {
     return crypto.createHash("sha256").update(content).digest("hex").slice(0, 16);
 }
 
-import crypto from "crypto";
+function entriesOf(files) {
+    if (!files) return [];
+    return files instanceof Map ? [...files.entries()] : Object.entries(files);
+}
 
 function buildManifest(files) {
-    const manifest = [];
-    for (const [path, entry] of Object.entries(files || {})) {
+    return entriesOf(files).map(([path, entry]) => {
         const content = typeof entry === "string" ? entry : entry?.content || "";
-        manifest.push({ path, hash: entry?.hash || hashContent(content), size: content.length });
-    }
-    return manifest;
+        return { path, hash: entry?.hash || hashContent(content), size: content.length };
+    });
 }
 
 function serializeFiles(files) {
     const output = {};
-    for (const [path, entry] of Object.entries(files || {})) output[path] = typeof entry === "string" ? entry : entry?.content || "";
+    for (const [path, entry] of entriesOf(files)) output[path] = typeof entry === "string" ? entry : entry?.content || "";
     return output;
 }
 
-function normalizePath(path) {
-    return path.startsWith("/") ? path : `/${path}`;
-}
+function normalizePath(path) { return path.startsWith("/") ? path : `/${path}`; }
 
 function projectResponse(project, extra = {}) {
     return {
@@ -42,7 +42,6 @@ function projectResponse(project, extra = {}) {
     };
 }
 
-// POST /api/projects/:id/chat
 export async function chat(req, res) {
     const { prompt } = req.body;
     if (!prompt || typeof prompt !== "string" || !prompt.trim()) return res.status(400).json({ error: "prompt is required" });
@@ -60,15 +59,14 @@ export async function chat(req, res) {
 
     try {
         const manifest = buildManifest(project.files);
-        const relevantFiles = serializeFiles(project.files);
-        const recentMessages = project.messages.slice(-6).map((message) => ({ role: message.role, content: message.content }));
+        const allFiles = serializeFiles(project.files);
+        const recentMessages = project.messages.slice(-6).map(({ role, content }) => ({ role, content }));
 
-        const result = await reviseProject(prompt.trim(), manifest, relevantFiles, recentMessages);
+        const result = await reviseProject(prompt.trim(), manifest, allFiles, recentMessages);
         const operations = Array.isArray(result.operations) ? result.operations : [];
         const errors = [];
         const applied = [];
 
-        // Reload before applying so the revision is based on the latest document.
         const current = await Project.findOne({ _id: project._id, owner: req.user.userId, version: expectedVersion });
         if (!current) return res.status(409).json({ error: "Project changed while the revision was being generated. Please retry." });
 
@@ -90,8 +88,9 @@ export async function chat(req, res) {
                     if (!existing) throw new Error("File does not exist");
                     if (operation.expectedHash && operation.expectedHash !== existing.hash) throw new Error("File changed since the AI revision context was generated");
                     const search = operation.search || "";
+                    if (!search) throw new Error("Search text is required");
                     const matches = existing.content.split(search).length - 1;
-                    if (!search || matches === 0) throw new Error("Search text was not found");
+                    if (matches === 0) throw new Error("Search text was not found");
                     if (operation.expectedMatches != null && matches !== operation.expectedMatches) throw new Error(`Expected ${operation.expectedMatches} matches, found ${matches}`);
                     const content = existing.content.replace(search, operation.replace || "");
                     current.files.set(path, { content, hash: hashContent(content) });
@@ -105,19 +104,11 @@ export async function chat(req, res) {
         current.version = expectedVersion + 1;
         current.status = "completed";
         current.error = errors.length ? `Revision completed with ${errors.length} failed operation(s)` : null;
-        current.messages.push({
-            role: "assistant",
-            content: result.description || (errors.length ? "Revision completed with errors." : "Revision applied successfully."),
-            timestamp: new Date(),
-        });
+        current.messages.push({ role: "assistant", content: result.description || "Revision applied successfully.", timestamp: new Date() });
         current.markModified("files");
         await current.save();
 
-        return res.json(projectResponse(current, {
-            applied,
-            errors,
-            aiDescription: result.description,
-        }));
+        return res.json(projectResponse(current, { applied, errors, aiDescription: result.description }));
     } catch (error) {
         console.error(`[AI Revision Error] ${error.message}`);
         const failed = await Project.findById(project._id);
