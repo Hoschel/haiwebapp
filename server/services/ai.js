@@ -8,11 +8,13 @@ import { inspectGeneratedCode, validateAndFixCode, validateRevisionContent } fro
 import { selectRelevantFiles } from "./fileRelevance.js";
 import { buildDependencyGraph, getAffectedFiles, getDependencyReport } from "./dependencyGraph.js";
 import { analyzeProjectIntegrity, getCriticalIntegrityErrors } from "./projectIntegrity.js";
+import { validateProjectBuild } from "./projectBuildValidator.js";
 
 const MODEL = process.env.OPENROUTER_MODEL || "openrouter/free";
 const MAX_CONCURRENCY = Math.max(1, parseInt(process.env.AI_MAX_CONCURRENCY || "4", 10) || 4);
 const MAX_GENERATION_REPAIRS = Math.max(0, Math.min(parseInt(process.env.AI_GENERATION_REPAIRS || "2", 10) || 2, 3));
 const MAX_INTEGRITY_REPAIRS = Math.max(0, Math.min(parseInt(process.env.AI_INTEGRITY_REPAIRS || "2", 10) || 2, 3));
+const MAX_BUILD_REPAIRS = Math.max(0, Math.min(parseInt(process.env.AI_BUILD_REPAIRS || "2", 10) || 2, 3));
 const MAX_REVISION_FILES = Math.max(3, Math.min(parseInt(process.env.AI_REVISION_MAX_FILES || "12", 10) || 12, 30));
 const MAX_REVISION_CONTEXT = Math.max(10000, Math.min(parseInt(process.env.AI_REVISION_MAX_CONTEXT || "50000", 10) || 50000, 100000));
 
@@ -64,7 +66,6 @@ async function repairProjectIntegrity(files, plan, prompt, callbacks) {
         for (const item of report.unresolvedImports) affected.add(item.from);
         const repairFiles = plan.files.filter((file) => affected.has(normalizePath(file.path))).slice(0, 6);
         if (!repairFiles.length) break;
-
         await pMap(repairFiles, async (file) => {
             try {
                 if (callbacks?.onFileStart) await callbacks.onFileStart(file.path);
@@ -73,11 +74,32 @@ async function repairProjectIntegrity(files, plan, prompt, callbacks) {
                 const result = await generateSingleFile(file, plan.files, prompt, { ...files }, repair);
                 files[normalizePath(result.path)] = result.code;
                 if (callbacks?.onFileComplete) await callbacks.onFileComplete(result.path, result.code);
-            } catch (error) {
-                console.warn(`[AI] Integrity repair failed for ${file.path}: ${error.message}`);
-            }
+            } catch (error) { console.warn(`[AI] Integrity repair failed for ${file.path}: ${error.message}`); }
         }, { concurrency: Math.min(MAX_CONCURRENCY, 3) });
         report = analyzeProjectIntegrity(files);
+    }
+    return report;
+}
+
+async function repairProjectBuild(files, plan, prompt, callbacks) {
+    let report = validateProjectBuild(files);
+    for (let round = 0; round < MAX_BUILD_REPAIRS && report.status !== "passed"; round += 1) {
+        const affectedPaths = new Set((report.errors || []).map((item) => item?.path).filter(Boolean).map(normalizePath));
+        let repairFiles = plan.files.filter((file) => affectedPaths.has(normalizePath(file.path)));
+        if (!repairFiles.length) repairFiles = plan.files.filter((file) => ["/App.js", "/App.jsx", "/main.js", "/main.jsx", "/index.js", "/index.jsx"].includes(normalizePath(file.path))).slice(0, 1);
+        repairFiles = repairFiles.slice(0, 6);
+        if (!repairFiles.length) break;
+        const details = (report.errors || []).slice(0, 20).map((item) => `${item.path || "project"}: ${item.error || "Build validation failed"}`).join("\n- ");
+        await pMap(repairFiles, async (file) => {
+            try {
+                if (callbacks?.onFileStart) await callbacks.onFileStart(file.path);
+                const repair = `FINAL PROJECT BUILD REPAIR. Build validation failed with:\n- ${details}\nRegenerate this COMPLETE file. Fix the root cause only, preserve the intended UI and existing project architecture, and do not use placeholders or merge markers.`;
+                const result = await generateSingleFile(file, plan.files, prompt, { ...files }, repair);
+                files[normalizePath(result.path)] = result.code;
+                if (callbacks?.onFileComplete) await callbacks.onFileComplete(result.path, result.code);
+            } catch (error) { console.warn(`[AI] Build repair failed for ${file.path}: ${error.message}`); }
+        }, { concurrency: Math.min(MAX_CONCURRENCY, 2) });
+        report = validateProjectBuild(files);
     }
     return report;
 }
@@ -116,13 +138,16 @@ export async function generateProject(prompt, callbacks) {
     }
     if (!files["/App.js"] && !files["/App.jsx"]) throw new Error("AI did not produce an application entry point");
 
-    const integrity = await repairProjectIntegrity(files, plan.files, prompt, callbacks);
-    const dependencyReport = integrity.dependency;
-    if (callbacks?.onValidation) await callbacks.onValidation({ type: "project-integrity", report: integrity });
-    if (!integrity.ok) {
-        throw new Error(`Generated project failed final integrity validation: ${getCriticalIntegrityErrors(integrity).slice(0, 10).join("; ")}`);
+    const integrity = await repairProjectIntegrity(files, plan, prompt, callbacks);
+    const build = await repairProjectBuild(files, plan, prompt, callbacks);
+    const finalIntegrity = analyzeProjectIntegrity(files);
+    if (callbacks?.onValidation) await callbacks.onValidation({ type: "project-integrity", report: finalIntegrity });
+    if (callbacks?.onValidation) await callbacks.onValidation({ type: "project-build", report: build });
+    if (!finalIntegrity.ok || build.status !== "passed") {
+        const errors = [...getCriticalIntegrityErrors(finalIntegrity), ...(build.errors || []).map((item) => `${item.path || "project"}: ${item.error || "Build validation failed"}`)];
+        throw new Error(`Generated project failed final validation: ${errors.slice(0, 10).join("; ")}`);
     }
-    return { files, description: plan.projectDescription, dependencyReport };
+    return { files, description: plan.projectDescription, dependencyReport: finalIntegrity.dependency, buildReport: build };
 }
 
 export async function reviseProject(prompt, manifest, allFiles, recentMessages) {
