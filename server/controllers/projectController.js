@@ -1,6 +1,6 @@
 import { Project } from "../models/Project.js";
 import crypto from "crypto";
-import { generateProject, reviseProject } from "../services/ai.js";
+import { generateProject } from "../services/ai.js";
 
 function hashContent(content) {
     return crypto.createHash("sha256").update(content).digest("hex").slice(0, 16);
@@ -9,9 +9,8 @@ function hashContent(content) {
 function serializeFiles(files) {
     const result = {};
     if (!files) return result;
-    for (const [path, entry] of Object.entries(files)) {
-        result[path] = typeof entry === "string" ? entry : entry?.content || "";
-    }
+    const entries = files instanceof Map ? files.entries() : Object.entries(files);
+    for (const [path, entry] of entries) result[path] = typeof entry === "string" ? entry : entry?.content || "";
     return result;
 }
 
@@ -35,9 +34,7 @@ function projectResponse(project, extra = {}) {
     };
 }
 
-function normalizePath(path) {
-    return path.startsWith("/") ? path : `/${path}`;
-}
+function normalizePath(path) { return path.startsWith("/") ? path : `/${path}`; }
 
 async function updateGeneratedFile(projectId, path, code, retries = 5) {
     for (let attempt = 0; attempt < retries; attempt += 1) {
@@ -67,15 +64,9 @@ export async function createProject(req, res) {
 
     const cleanPrompt = prompt.trim();
     const project = await Project.create({
-        name: "Planning project...",
-        description: cleanPrompt,
-        files: new Map(),
-        messages: [
-            { role: "user", content: cleanPrompt },
-            { role: "assistant", content: "Planning project structure..." },
-        ],
-        owner: req.user.userId,
-        status: "pending",
+        name: "Planning project...", description: cleanPrompt, files: new Map(),
+        messages: [{ role: "user", content: cleanPrompt }, { role: "assistant", content: "Planning project structure..." }],
+        owner: req.user.userId, status: "pending",
     });
 
     runBackgroundGeneration(project._id.toString(), cleanPrompt).catch((err) => console.error(`[Background AI] Fatal generation error for ${project._id}:`, err));
@@ -92,9 +83,7 @@ async function runBackgroundGeneration(projectId, prompt) {
                     $push: { messages: { role: "assistant", content: `Planned website structure:\n${fileList}`, timestamp: new Date() } },
                 });
             },
-            onFileStart: async (path) => {
-                await Project.findByIdAndUpdate(projectId, { $set: { currentFile: normalizePath(path) } });
-            },
+            onFileStart: async (path) => Project.findByIdAndUpdate(projectId, { $set: { currentFile: normalizePath(path) } }),
             onFileComplete: async (path, code) => updateGeneratedFile(projectId, path, code),
         });
 
@@ -156,73 +145,6 @@ export async function updateProjectFiles(req, res) {
         return res.status(409).json({ error: "Project was updated elsewhere. Reload before saving again.", project: latest ? projectResponse(latest) : undefined });
     }
     return res.json(projectResponse(project));
-}
-
-export async function chatProject(req, res) {
-    const { prompt } = req.body;
-    if (!req.user) return res.status(401).json({ error: "Unauthorized" });
-    if (!prompt || typeof prompt !== "string" || !prompt.trim()) return res.status(400).json({ error: "prompt is required" });
-
-    const project = await Project.findOne({ _id: req.params.id, owner: req.user.userId });
-    if (!project) return res.status(404).json({ error: "Project not found" });
-    if (["generating", "pending", "revising"].includes(project.status)) return res.status(409).json({ error: "Project is busy. Wait for the current operation to finish." });
-
-    const originalVersion = project.version;
-    project.status = "revising";
-    project.error = null;
-    project.messages.push({ role: "user", content: prompt.trim(), timestamp: new Date() });
-    await project.save();
-
-    try {
-        const manifest = Object.entries(project.files || {}).map(([path, entry]) => ({ path, hash: entry.hash, size: entry.content?.length || 0 }));
-        const relevantFiles = serializeFiles(project.files);
-        const result = await reviseProject(prompt.trim(), manifest, relevantFiles, project.messages.slice(-6));
-
-        const updated = await Project.findOne({ _id: project._id, owner: req.user.userId, version: originalVersion + 1 });
-        const current = updated || await Project.findOne({ _id: project._id, owner: req.user.userId });
-        if (!current) throw new Error("Project disappeared during revision");
-
-        const errors = [];
-        for (const operation of result.operations || []) {
-            const path = normalizePath(operation.path);
-            const currentEntry = current.files.get(path);
-            try {
-                if (operation.op === "create") {
-                    if (currentEntry) throw new Error("File already exists");
-                    current.files.set(path, { content: operation.content || "", hash: hashContent(operation.content || "") });
-                } else if (operation.op === "delete") {
-                    current.files.delete(path);
-                } else if (operation.op === "update") {
-                    if (!currentEntry) throw new Error("File does not exist");
-                    if (operation.expectedHash && operation.expectedHash !== currentEntry.hash) throw new Error("File changed since revision context was generated");
-                    const content = currentEntry.content;
-                    if (!content.includes(operation.search)) throw new Error("Search text was not found");
-                    const matches = content.split(operation.search).length - 1;
-                    if (operation.expectedMatches != null && matches !== operation.expectedMatches) throw new Error(`Expected ${operation.expectedMatches} matches, found ${matches}`);
-                    const next = content.replace(operation.search, operation.replace ?? "");
-                    current.files.set(path, { content: next, hash: hashContent(next) });
-                }
-            } catch (error) {
-                errors.push({ path, op: operation.op, error: error.message });
-            }
-        }
-
-        current.messages.push({ role: "assistant", content: errors.length ? `Revision completed with ${errors.length} failed operation(s).` : "Revision applied successfully.", timestamp: new Date() });
-        current.status = "completed";
-        current.version += 1;
-        current.markModified("files");
-        await current.save();
-
-        return res.json(projectResponse(current, { errors }));
-    } catch (error) {
-        const failed = await Project.findById(project._id);
-        if (failed) {
-            failed.status = "failed";
-            failed.error = error.message || "Revision failed";
-            await failed.save().catch(() => {});
-        }
-        return res.status(500).json({ error: error.message || "Revision failed" });
-    }
 }
 
 export async function publishProject(req, res) {
