@@ -7,18 +7,20 @@ import { normalizeContent } from "./contentNormalizer.js";
 import { inspectGeneratedCode, validateAndFixCode, validateRevisionContent } from "./codeValidator.js";
 import { selectRelevantFiles } from "./fileRelevance.js";
 import { buildDependencyGraph, getAffectedFiles, getDependencyReport } from "./dependencyGraph.js";
+import { analyzeProjectIntegrity, getCriticalIntegrityErrors } from "./projectIntegrity.js";
 
 const MODEL = process.env.OPENROUTER_MODEL || "openrouter/free";
 const MAX_CONCURRENCY = Math.max(1, parseInt(process.env.AI_MAX_CONCURRENCY || "4", 10) || 4);
 const MAX_GENERATION_REPAIRS = Math.max(0, Math.min(parseInt(process.env.AI_GENERATION_REPAIRS || "2", 10) || 2, 3));
+const MAX_INTEGRITY_REPAIRS = Math.max(0, Math.min(parseInt(process.env.AI_INTEGRITY_REPAIRS || "2", 10) || 2, 3));
 const MAX_REVISION_FILES = Math.max(3, Math.min(parseInt(process.env.AI_REVISION_MAX_FILES || "12", 10) || 12, 30));
 const MAX_REVISION_CONTEXT = Math.max(10000, Math.min(parseInt(process.env.AI_REVISION_MAX_CONTEXT || "50000", 10) || 50000, 100000));
 
 const openrouter = createOpenAI({ baseURL: "https://openrouter.ai/api/v1", apiKey: process.env.OPENROUTER_API_KEY });
 const model = openrouter(MODEL);
 
-async function generateSingleFile(file, allFiles, prompt, alreadyGeneratedFiles) {
-    let repairContext = "";
+async function generateSingleFile(file, allFiles, prompt, alreadyGeneratedFiles, extraRepair = "") {
+    let repairContext = extraRepair;
     for (let attempt = 0; attempt <= MAX_GENERATION_REPAIRS; attempt += 1) {
         const system = buildFileCodeSystem(allFiles, alreadyGeneratedFiles);
         const userMsg = [`Project: ${prompt}`, `Write the complete code for: ${file.path}`, `Purpose: ${file.description}`, repairContext].filter(Boolean).join("\n\n");
@@ -50,6 +52,34 @@ function createFallback(file) {
     const safeName = path.split("/").pop()?.replace(/\.[^.]+$/, "") || "Placeholder";
     const componentName = safeName.replace(/[^a-zA-Z0-9_$]/g, "") || "Placeholder";
     return `import React from 'react';\n\nexport default function ${componentName}() {\n  return <div className='p-8 text-center text-zinc-400'>Component generation failed. Please retry.</div>;\n}\n`;
+}
+
+async function repairProjectIntegrity(files, plan, prompt, callbacks) {
+    let report = analyzeProjectIntegrity(files);
+    for (let round = 0; round < MAX_INTEGRITY_REPAIRS && !report.ok; round += 1) {
+        const critical = getCriticalIntegrityErrors(report);
+        if (!critical.length) break;
+        const affected = new Set();
+        for (const item of report.syntaxErrors) affected.add(item.path);
+        for (const item of report.unresolvedImports) affected.add(item.from);
+        const repairFiles = plan.files.filter((file) => affected.has(normalizePath(file.path))).slice(0, 6);
+        if (!repairFiles.length) break;
+
+        await pMap(repairFiles, async (file) => {
+            try {
+                if (callbacks?.onFileStart) await callbacks.onFileStart(file.path);
+                const errorsForFile = critical.filter((error) => error.startsWith(`${normalizePath(file.path)}:`));
+                const repair = `FINAL PROJECT INTEGRITY REPAIR. The project currently has these issues:\n- ${errorsForFile.join("\n- ")}\nRegenerate this COMPLETE file so its imports and syntax are compatible with the existing project files.`;
+                const result = await generateSingleFile(file, plan.files, prompt, { ...files }, repair);
+                files[normalizePath(result.path)] = result.code;
+                if (callbacks?.onFileComplete) await callbacks.onFileComplete(result.path, result.code);
+            } catch (error) {
+                console.warn(`[AI] Integrity repair failed for ${file.path}: ${error.message}`);
+            }
+        }, { concurrency: Math.min(MAX_CONCURRENCY, 3) });
+        report = analyzeProjectIntegrity(files);
+    }
+    return report;
 }
 
 export async function generateProject(prompt, callbacks) {
@@ -86,12 +116,13 @@ export async function generateProject(prompt, callbacks) {
     }
     if (!files["/App.js"] && !files["/App.jsx"]) throw new Error("AI did not produce an application entry point");
 
-    const dependencyResult = buildDependencyGraph(files);
-    if (dependencyResult.unresolved.length) {
-        console.warn(`[AI] Generation produced ${dependencyResult.unresolved.length} unresolved local import(s).`, dependencyResult.unresolved);
-        if (callbacks?.onValidation) await callbacks.onValidation({ type: "dependency", report: getDependencyReport(dependencyResult) });
+    const integrity = await repairProjectIntegrity(files, plan.files, prompt, callbacks);
+    const dependencyReport = integrity.dependency;
+    if (callbacks?.onValidation) await callbacks.onValidation({ type: "project-integrity", report: integrity });
+    if (!integrity.ok) {
+        throw new Error(`Generated project failed final integrity validation: ${getCriticalIntegrityErrors(integrity).slice(0, 10).join("; ")}`);
     }
-    return { files, description: plan.projectDescription, dependencyReport: getDependencyReport(dependencyResult) };
+    return { files, description: plan.projectDescription, dependencyReport };
 }
 
 export async function reviseProject(prompt, manifest, allFiles, recentMessages) {
@@ -101,7 +132,6 @@ export async function reviseProject(prompt, manifest, allFiles, recentMessages) 
     const affectedPaths = getAffectedFiles(graphResult, selectedPaths, { includeDependencies: true, includeDependents: true });
     const contextPaths = [...new Set([...selectedPaths, ...affectedPaths])].filter((path) => allFiles[path]).slice(0, MAX_REVISION_FILES);
     const contextFiles = Object.fromEntries(contextPaths.map((path) => [path, allFiles[path]]));
-
     const contextParts = ["## Current Project Files (manifest)", "```", ...manifest.map((file) => `${file.path} (${file.hash}, ${file.size}B)`), "```", "\n## Relevant and Dependency-Affected Files", ...Object.entries(contextFiles).map(([path, content]) => `\n### ${path}\n\`\`\`javascript\n${content}\n\`\`\``), `\n## Dependency Report\n${JSON.stringify(getDependencyReport(graphResult))}`];
     if (recentMessages?.length) { contextParts.push("\n## Recent Conversation"); for (const message of recentMessages.slice(-3)) contextParts.push(`${message.role}: ${message.content}`); }
     contextParts.push(`\n## Revision Request\n${prompt}`);
