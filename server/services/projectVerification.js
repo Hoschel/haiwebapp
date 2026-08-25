@@ -1,10 +1,11 @@
 import { analyzeProjectIntegrity, getCriticalIntegrityErrors } from "./projectIntegrity.js";
 
-export function verifyProject(files, runtime = {}) {
+export function verifyProject(files, runtime = {}, version = null) {
     const integrity = analyzeProjectIntegrity(files);
     const criticalErrors = getCriticalIntegrityErrors(integrity);
     const staticStatus = integrity.ok ? "passed" : "failed";
-    const runtimeStatus = runtime.status || "pending";
+    const runtimeMatchesVersion = version == null || runtime.version === version;
+    const runtimeStatus = runtimeMatchesVersion ? (runtime.status || "pending") : "pending";
     const runtimeOk = runtimeStatus !== "failed";
     return {
         status: integrity.ok && runtimeOk ? (runtimeStatus === "passed" ? "verified" : "pending_runtime") : "failed",
@@ -17,12 +18,13 @@ export function verifyProject(files, runtime = {}) {
         },
         runtime: {
             status: runtimeStatus,
-            checkedAt: runtime.checkedAt || null,
-            error: runtime.error || null,
+            checkedAt: runtimeMatchesVersion ? (runtime.checkedAt || null) : null,
+            error: runtimeMatchesVersion ? (runtime.error || null) : null,
+            version: runtimeMatchesVersion ? (runtime.version ?? null) : null,
         },
     };
 }
 
-export function withRuntimeVerification(files, previousVerification, runtime) {
-    return verifyProject(files, { ...(previousVerification?.runtime || {}), ...runtime, checkedAt: new Date() });
+export function withRuntimeVerification(files, previousVerification, runtime, version = null) {
+    return verifyProject(files, { ...(previousVerification?.runtime || {}), ...runtime, version, checkedAt: new Date() }, version);
 }
