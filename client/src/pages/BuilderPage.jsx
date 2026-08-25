@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react'
+import React, { useEffect, useRef, useState } from 'react'
 import { useAppContext } from '../context/AppContext'
 import { useNavigate, useParams } from 'react-router-dom';
 import Loading from '../components/Loading';
@@ -8,6 +8,7 @@ import ChatPanel from '../components/ChatPanel';
 import FileExplorer from '../components/FileExplorer';
 import PreviewPanel from '../components/PreviewPanel';
 import AgentProgressDashboard from '../components/AgentProgressDashboard';
+import RuntimeRepairProgress from '../components/RuntimeRepairProgress';
 import PublishModel from '../components/PublishModel';
 import api from '../api/api';
 import toast from 'react-hot-toast';
@@ -19,6 +20,8 @@ const BuilderPage = () => {
   const [leftTab, setLeftTab] = useState("chat");
   const [publishing, setPublishing] = useState(false);
   const [publishUrl, setPublishUrl] = useState(null);
+  const [repairPhase, setRepairPhase] = useState(null);
+  const repairTimerRef = useRef(null);
 
   const {
     activeProject,
@@ -32,12 +35,36 @@ const BuilderPage = () => {
     chatLoading,
     handleChat,
     saveState,
+    runtimeError,
+    repairingRuntime,
+    runtimeRepairCount,
   } = useAppContext();
 
   useEffect(() => {
     if (!id) return;
     loadProject(id);
   }, [id, loadProject]);
+
+  useEffect(() => {
+    if (repairTimerRef.current) clearTimeout(repairTimerRef.current);
+    if (repairingRuntime) {
+      setRepairPhase("analyzing");
+      repairTimerRef.current = setTimeout(() => setRepairPhase("locating"), 350);
+      return;
+    }
+    if (runtimeRepairCount > 0 && !runtimeError) {
+      setRepairPhase("verifying");
+      repairTimerRef.current = setTimeout(() => setRepairPhase("fixed"), 600);
+      return;
+    }
+    if (runtimeRepairCount >= 2 && runtimeError) {
+      setRepairPhase("failed");
+      return;
+    }
+    setRepairPhase(null);
+  }, [repairingRuntime, runtimeRepairCount, runtimeError]);
+
+  useEffect(() => () => repairTimerRef.current && clearTimeout(repairTimerRef.current), []);
 
   const handleOpenPreview = () => {
     if (id) window.open(`/preview/${id}`, "_blank", "noopener,noreferrer");
@@ -69,6 +96,8 @@ const BuilderPage = () => {
   if (loadingActiveProject || !activeProject) return <Loading />;
 
   const isGenerating = ["pending", "generating", "revising"].includes(activeProject.status);
+  const showRepairOverlay = !isGenerating && activeProject.status !== "failed" && repairPhase;
+  const effectiveRepairPhase = repairingRuntime && repairPhase === "locating" ? "locating" : repairingRuntime ? "repairing" : repairPhase;
 
   return (
     <div className='h-screen flex flex-col bg-white overflow-hidden text-zinc-900 relative'>
@@ -99,18 +128,26 @@ const BuilderPage = () => {
           </div>
           <div className='flex-1 overflow-hidden'>
             {leftTab === 'chat' ? (
-              <ChatPanel messages={activeProject.messages} onSend={handleChat} loading={chatLoading || activeProject.status === "revising"} />
+              <ChatPanel messages={activeProject.messages} onSend={handleChat} loading={chatLoading || activeProject.status === "revising" || repairingRuntime} />
             ) : (
               <FileExplorer files={activeProject.files} activeFile={activeFile} onFileSelect={(path) => { setActiveFile(path); setShowCode(true); }} />
             )}
           </div>
         </div>
 
-        <div className='flex-1 overflow-hidden'>
+        <div className='flex-1 overflow-hidden relative'>
           {isGenerating || activeProject.status === "failed" ? (
             <AgentProgressDashboard project={activeProject} />
           ) : (
             <PreviewPanel project={activeProject} activeFile={activeFile} showCode={showCode} />
+          )}
+          {showRepairOverlay && (
+            <RuntimeRepairProgress
+              active={repairingRuntime}
+              attempt={runtimeRepairCount}
+              error={runtimeError}
+              phase={effectiveRepairPhase}
+            />
           )}
         </div>
       </div>
