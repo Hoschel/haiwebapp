@@ -11,32 +11,45 @@ import AgentProgressDashboard from '../components/AgentProgressDashboard';
 import PublishModel from '../components/PublishModel';
 import api from '../api/api';
 import toast from 'react-hot-toast';
-import {exportProjectZip} from '../utils/exportProject';
+import { exportProjectZip } from '../utils/exportProject';
 
 const BuilderPage = () => {
-
-  const {id} = useParams()
-  const navigate = useNavigate()
+  const { id } = useParams();
+  const navigate = useNavigate();
   const [leftTab, setLeftTab] = useState("chat");
   const [publishing, setPublishing] = useState(false);
   const [publishUrl, setPublishUrl] = useState(null);
 
-  const {activeProject, loadingActiveProject, activeFile, showCode, setActiveFile, setShowCode, loadProject, logout, chatLoading, handleChat} = useAppContext();
+  const {
+    activeProject,
+    loadingActiveProject,
+    activeFile,
+    showCode,
+    setActiveFile,
+    setShowCode,
+    loadProject,
+    logout,
+    chatLoading,
+    handleChat,
+    saveState,
+  } = useAppContext();
 
-  useEffect(()=>{
-    if(!id) return;
-    loadProject(id)
-  },[id, loadProject])
+  useEffect(() => {
+    if (!id) return;
+    loadProject(id);
+  }, [id, loadProject]);
 
-  const handleOpenPreview = ()=>{
-    if(!id) return;
-    window.open(`/preview/${id}`, "_blank")
-  }
+  const handleOpenPreview = () => {
+    if (id) window.open(`/preview/${id}`, "_blank", "noopener,noreferrer");
+  };
 
   const handlePublish = async () => {
-    if(!id) return;
-    setPublishing(true)
-    try{
+    if (!id || saveState === "conflict" || saveState === "saving") {
+      if (saveState === "conflict") toast.error("Resolve the save conflict before publishing.");
+      return;
+    }
+    setPublishing(true);
+    try {
       await api.post(`/api/project/${id}/publish`);
       const url = `${window.location.origin}/publish/${id}`;
       setPublishUrl(url);
@@ -44,80 +57,66 @@ const BuilderPage = () => {
     } catch (err) {
       console.error("Publish failed:", err);
       toast.error(err?.response?.data?.error || "Publish failed");
-    }finally{
-      setPublishing(false)
+    } finally {
+      setPublishing(false);
     }
-  }
+  };
 
-  const handleDownload =  () => {
-    if(!activeProject) return;
-    exportProjectZip(activeProject)
-  }
+  const handleDownload = () => {
+    if (activeProject) exportProjectZip(activeProject);
+  };
 
-  if(loadingActiveProject || !activeProject){
-    return <Loading />
-  }
+  if (loadingActiveProject || !activeProject) return <Loading />;
+
+  const isGenerating = ["pending", "generating", "revising"].includes(activeProject.status);
 
   return (
     <div className='h-screen flex flex-col bg-white overflow-hidden text-zinc-900 relative'>
-      {/* Top Bar Header */}
       <BuilderHeader
-      projectName={activeProject.name}
-      version={activeProject.version}
-      showCode={showCode}
-      publishing={publishing}
-      onToggleShowCode={()=> setShowCode(!showCode)}
-      onOpenPreview={handleOpenPreview}
-      onPublish={handlePublish}
-      onDownload={handleDownload}
-      onBack={() => navigate("/")}
-      onLogout={logout}/>
+        projectName={activeProject.name}
+        version={activeProject.version}
+        saveState={saveState}
+        status={activeProject.status}
+        showCode={showCode}
+        publishing={publishing}
+        onToggleShowCode={() => setShowCode(!showCode)}
+        onOpenPreview={handleOpenPreview}
+        onPublish={handlePublish}
+        onDownload={handleDownload}
+        onBack={() => navigate("/")}
+        onLogout={logout}
+      />
 
-      {/* Main Layout */}
       <div className='flex-1 flex overflow-hidden'>
-        {/* Left Sidebar */}
         <div className='w-[320px] shrink-0 flex flex-col border-r border-zinc-200 bg-white'>
-          {/* Sidebar Tabs */}
           <div className='flex border-b border-zinc-100'>
-            <button onClick={()=> setLeftTab("chat")}
-              className={`flex-1 flex items-center justify-center gap-1.5 py-2.5 text-xs font-medium cursor-pointer ${leftTab === "chat" ? "text-zinc-900 border-b-2 border-zinc-900" : "text-zinc-400 hover:text-zinc-700"}`}>
+            <button onClick={() => setLeftTab("chat")} className={`flex-1 flex items-center justify-center gap-1.5 py-2.5 text-xs font-medium cursor-pointer ${leftTab === "chat" ? "text-zinc-900 border-b-2 border-zinc-900" : "text-zinc-400 hover:text-zinc-700"}`}>
               <MessageSquareIcon size={13}/> Chat
             </button>
-
-            <button onClick={()=> setLeftTab("files")}
-              className={`flex-1 flex items-center justify-center gap-1.5 py-2.5 text-xs font-medium cursor-pointer ${leftTab === "files" ? "text-zinc-900 border-b-2 border-zinc-900" : "text-zinc-400 hover:text-zinc-700"}`}>
+            <button onClick={() => setLeftTab("files")} className={`flex-1 flex items-center justify-center gap-1.5 py-2.5 text-xs font-medium cursor-pointer ${leftTab === "files" ? "text-zinc-900 border-b-2 border-zinc-900" : "text-zinc-400 hover:text-zinc-700"}`}>
               <FolderTreeIcon size={13}/> Files
             </button>
           </div>
-
-          {/* Sidebar Content */}
           <div className='flex-1 overflow-hidden'>
-            {
-              leftTab === 'chat' ? (
-                <ChatPanel messages={activeProject.messages} onSend={handleChat} loading={chatLoading} />
-              ) : (
-                <FileExplorer files={activeProject.files} activeFile={activeFile} onFileSelect={(path)=>{
-                  setActiveFile(path);
-                  setShowCode(true)
-                }} />
-              )
-            }
+            {leftTab === 'chat' ? (
+              <ChatPanel messages={activeProject.messages} onSend={handleChat} loading={chatLoading || activeProject.status === "revising"} />
+            ) : (
+              <FileExplorer files={activeProject.files} activeFile={activeFile} onFileSelect={(path) => { setActiveFile(path); setShowCode(true); }} />
+            )}
           </div>
         </div>
 
-        {/* Preview / Code Area */}
-
-        <div className='flex-1 overlow-hidden'>
-          {activeProject.status === "pending" || activeProject.status === "generating" || activeProject.status === "failed" ? (
+        <div className='flex-1 overflow-hidden'>
+          {isGenerating || activeProject.status === "failed" ? (
             <AgentProgressDashboard project={activeProject} />
           ) : (
             <PreviewPanel project={activeProject} activeFile={activeFile} showCode={showCode} />
           )}
         </div>
       </div>
-      {publishUrl && <PublishModel publishUrl={publishUrl} onClose={()=> setPublishUrl(null)} />}
+      {publishUrl && <PublishModel publishUrl={publishUrl} onClose={() => setPublishUrl(null)} />}
     </div>
-  )
-}
+  );
+};
 
-export default BuilderPage
+export default BuilderPage;
