@@ -1,25 +1,25 @@
 import { analyzeProjectIntegrity, getCriticalIntegrityErrors } from "./projectIntegrity.js";
+import { validateProjectBuild } from "./projectBuildValidator.js";
 
 export function verifyProject(files, runtime = {}, version = null) {
     const integrity = analyzeProjectIntegrity(files);
     const criticalErrors = getCriticalIntegrityErrors(integrity);
-    const staticStatus = integrity.ok ? "passed" : "failed";
-    // A passed runtime result without a persisted version is never trusted.
-    // When the caller supplies the project version, require an exact match;
-    // when it does not (for example legacy publish callers), require at least
-    // a versioned runtime result rather than accepting old unversioned data.
+    const build = validateProjectBuild(files);
+    const staticStatus = integrity.ok && build.status === "passed" ? "passed" : "failed";
     const runtimeMatchesVersion = version == null ? Number.isInteger(runtime.version) : runtime.version === version;
     const runtimeStatus = runtimeMatchesVersion ? (runtime.status || "pending") : "pending";
     const runtimeOk = runtimeStatus !== "failed";
+    const staticErrors = [...criticalErrors, ...build.errors.map((item) => `${item.path || "project"}: ${item.error}`)];
     return {
-        status: integrity.ok && runtimeOk ? (runtimeStatus === "passed" ? "verified" : "pending_runtime") : "failed",
+        status: staticStatus === "passed" && runtimeOk ? (runtimeStatus === "passed" ? "verified" : "pending_runtime") : "failed",
         static: {
             status: staticStatus,
             checkedAt: new Date(),
-            errors: criticalErrors,
+            errors: staticErrors,
             unresolvedImports: integrity.unresolvedImports,
             syntaxErrors: integrity.syntaxErrors,
         },
+        build,
         runtime: {
             status: runtimeStatus,
             checkedAt: runtimeMatchesVersion ? (runtime.checkedAt || null) : null,
