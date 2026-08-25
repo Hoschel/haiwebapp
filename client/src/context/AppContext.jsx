@@ -21,11 +21,13 @@ async function hashContent(content) {
 export function AppContextProvider({ children }) {
     const navigate = useNavigate();
     const versionRef = useRef(0), serverFilesRef = useRef({}), conflictRef = useRef(null);
+    const runtimeRepairRef = useRef({ signature: "", timestamp: 0 });
     const [user, setUser] = useState(null), [loadingUser, setLoadingUser] = useState(true);
     const [projects, setProjects] = useState([]), [loadingProjects, setLoadingProjects] = useState(true);
     const [activeProject, setActiveProject] = useState(null), [loadingActiveProject, setLoadingActiveProject] = useState(false);
     const [chatLoading, setChatLoading] = useState(false), [generatingProject, setGeneratingProject] = useState(false);
     const [saveState, setSaveState] = useState("saved"), [conflict, setConflict] = useState(null);
+    const [runtimeError, setRuntimeError] = useState(null), [repairingRuntime, setRepairingRuntime] = useState(false);
     const [activeFile, setActiveFile] = useState("/App.js"), [showCode, setShowCode] = useState(false);
 
     const adoptServerProject = useCallback((project) => {
@@ -36,18 +38,37 @@ export function AppContextProvider({ children }) {
     useEffect(() => { checkSession(); }, [checkSession]);
     const login = useCallback(async (email, password) => { try { const { data } = await api.post("/api/auth/login", { email, password }); setUser(data.user); navigate("/"); } catch (e) { const m = e?.response?.data?.error || "Invalid email or password."; toast.error(m); throw new Error(m); } }, [navigate]);
     const register = useCallback(async (name, email, password) => { try { const { data } = await api.post("/api/auth/register", { name, email, password }); setUser(data.user); navigate("/"); } catch (e) { const m = e?.response?.data?.error || "Registration failed."; toast.error(m); throw new Error(m); } }, [navigate]);
-    const logout = useCallback(async () => { try { await api.post("/api/auth/logout"); } catch {} setUser(null); setProjects([]); setActiveProject(null); serverFilesRef.current = {}; conflictRef.current = null; setConflict(null); setSaveState("saved"); navigate("/login", { replace: true }); }, [navigate]);
+    const logout = useCallback(async () => { try { await api.post("/api/auth/logout"); } catch {} setUser(null); setProjects([]); setActiveProject(null); serverFilesRef.current = {}; conflictRef.current = null; setConflict(null); setRuntimeError(null); setRepairingRuntime(false); setSaveState("saved"); navigate("/login", { replace: true }); }, [navigate]);
     const loadProjects = useCallback(async () => { if (!user) { setProjects([]); setLoadingProjects(false); return; } setLoadingProjects(true); try { const { data } = await api.get("/api/projects"); setProjects(Array.isArray(data) ? data : []); } catch (e) { toast.error(e?.response?.data?.error || "Failed to load projects."); } finally { setLoadingProjects(false); } }, [user]);
     useEffect(() => { loadProjects(); }, [loadProjects]);
-    const loadProject = useCallback(async (id, silent = false) => { if (!user || !id) return null; if (!silent) setLoadingActiveProject(true); try { const { data } = await api.get(`/api/projects/${id}`); adoptServerProject(data); setConflict(null); conflictRef.current = null; setSaveState("saved"); const paths = Object.keys(data.files || {}); setActiveFile((p) => paths.includes(p) ? p : paths.includes("/App.js") ? "/App.js" : paths[0] || "/App.js"); return data; } catch (e) { if (!silent) { toast.error(e?.response?.data?.error || "Failed to load project."); navigate("/", { replace: true }); } return null; } finally { if (!silent) setLoadingActiveProject(false); } }, [user, navigate, adoptServerProject]);
+    const loadProject = useCallback(async (id, silent = false) => { if (!user || !id) return null; if (!silent) setLoadingActiveProject(true); try { const { data } = await api.get(`/api/projects/${id}`); adoptServerProject(data); setConflict(null); conflictRef.current = null; setRuntimeError(null); setSaveState("saved"); const paths = Object.keys(data.files || {}); setActiveFile((p) => paths.includes(p) ? p : paths.includes("/App.js") ? "/App.js" : paths[0] || "/App.js"); return data; } catch (e) { if (!silent) { toast.error(e?.response?.data?.error || "Failed to load project."); navigate("/", { replace: true }); } return null; } finally { if (!silent) setLoadingActiveProject(false); } }, [user, navigate, adoptServerProject]);
     useEffect(() => { if (!user || !activeProject?._id) return; if (!["generating", "pending", "revising"].includes(activeProject.status)) { setChatLoading(false); return; } setChatLoading(true); const id = setInterval(() => loadProject(activeProject._id, true), 2000); return () => clearInterval(id); }, [user, activeProject?._id, activeProject?.status, loadProject]);
     const handleGenerate = useCallback(async (prompt) => { if (!user) return toast.error("Please login first."); if (!prompt?.trim()) return toast.error("Please enter a prompt."); setGeneratingProject(true); try { const { data } = await api.post("/api/projects", { prompt: prompt.trim() }); navigate(`/builder/${data._id}`); } catch (e) { toast.error(e?.response?.data?.error || "Failed to generate project."); } finally { setGeneratingProject(false); } }, [navigate, user]);
     const handleDelete = useCallback(async (id) => { try { await api.delete(`/api/projects/${id}`); setProjects((p) => p.filter((x) => x._id !== id)); } catch (e) { toast.error(e?.response?.data?.error || "Failed to delete project."); } }, []);
 
     const handleChat = useCallback(async (prompt) => {
         if (!activeProject || !user || conflictRef.current) return conflictRef.current && toast.error("Resolve the current file conflict first.");
-        setChatLoading(true); try { const { data } = await api.post(`/api/projects/${activeProject._id}/chat`, { prompt }); adoptServerProject(data); toast.success(data.errors?.length ? `${data.errors.length} patch(es) failed` : `Updated to version ${data.version}`); } catch (e) { toast.error(e?.response?.data?.error || "Revision request failed"); } finally { setChatLoading(false); }
+        setChatLoading(true); try { const { data } = await api.post(`/api/projects/${activeProject._id}/chat`, { prompt }); adoptServerProject(data); setRuntimeError(null); toast.success(data.errors?.length ? `${data.errors.length} patch(es) failed` : `Updated to version ${data.version}`); } catch (e) { toast.error(e?.response?.data?.error || "Revision request failed"); } finally { setChatLoading(false); }
     }, [activeProject, user, adoptServerProject]);
+
+    const reportRuntimeError = useCallback((error) => {
+        if (!activeProject || !error?.message) return;
+        setRuntimeError(error);
+        if (activeProject.status !== "completed" || chatLoading || repairingRuntime || conflictRef.current) return;
+        const signature = `${activeProject._id}:${activeProject.version}:${error.message}`;
+        const now = Date.now();
+        if (runtimeRepairRef.current.signature === signature && now - runtimeRepairRef.current.timestamp < 30000) return;
+        runtimeRepairRef.current = { signature, timestamp: now };
+        setRepairingRuntime(true);
+        const prompt = [
+            "The generated project has a runtime error in the preview.",
+            "Repair the existing project; do not redesign unrelated parts.",
+            `Runtime error: ${error.message}`,
+            error.stack ? `Stack trace:\n${error.stack}` : "",
+            "Identify the smallest relevant set of files, preserve the current UI and behavior, and fix the root cause."
+        ].filter(Boolean).join("\n\n");
+        handleChat(prompt).finally(() => setRepairingRuntime(false));
+    }, [activeProject, chatLoading, repairingRuntime, handleChat]);
 
     const debouncedSave = useMemo(() => debounce(async (patches, id, version, baseFiles, localFiles) => {
         try { const { data } = await api.patch(`/api/projects/${id}/files`, { patches, version }); adoptServerProject(data); setSaveState("saved"); }
@@ -98,7 +119,7 @@ export function AppContextProvider({ children }) {
         catch (e) { setSaveState(e.response?.status === 409 ? "conflict" : "error"); if (e.response?.status !== 409) toast.error(e?.response?.data?.error || "Failed to save resolution."); }
     }, [adoptServerProject]);
 
-    const value = { user, loadingUser, login, register, logout, projects, loadingProjects, activeProject, loadingActiveProject, chatLoading, generatingProject, activeFile, setActiveFile, showCode, setShowCode, saveState, conflict, loadProjects, loadProject, handleGenerate, handleDelete, updateProjectFiles, handleChat, resolveConflict };
+    const value = { user, loadingUser, login, register, logout, projects, loadingProjects, activeProject, loadingActiveProject, chatLoading, generatingProject, activeFile, setActiveFile, showCode, setShowCode, saveState, conflict, runtimeError, repairingRuntime, loadProjects, loadProject, handleGenerate, handleDelete, updateProjectFiles, handleChat, resolveConflict, reportRuntimeError };
     return <AppContext.Provider value={value}>{children}</AppContext.Provider>;
 }
 export function useAppContext() { const context = useContext(AppContext); if (!context) throw new Error("useAppContext must be used within an AppContextProvider."); return context; }
