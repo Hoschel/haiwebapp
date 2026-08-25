@@ -28,6 +28,7 @@ export function AppContextProvider({ children }) {
     const [chatLoading, setChatLoading] = useState(false), [generatingProject, setGeneratingProject] = useState(false);
     const [saveState, setSaveState] = useState("saved"), [conflict, setConflict] = useState(null);
     const [runtimeError, setRuntimeError] = useState(null), [repairingRuntime, setRepairingRuntime] = useState(false);
+    const [runtimeRepairCount, setRuntimeRepairCount] = useState(0);
     const [activeFile, setActiveFile] = useState("/App.js"), [showCode, setShowCode] = useState(false);
 
     const adoptServerProject = useCallback((project) => {
@@ -38,10 +39,10 @@ export function AppContextProvider({ children }) {
     useEffect(() => { checkSession(); }, [checkSession]);
     const login = useCallback(async (email, password) => { try { const { data } = await api.post("/api/auth/login", { email, password }); setUser(data.user); navigate("/"); } catch (e) { const m = e?.response?.data?.error || "Invalid email or password."; toast.error(m); throw new Error(m); } }, [navigate]);
     const register = useCallback(async (name, email, password) => { try { const { data } = await api.post("/api/auth/register", { name, email, password }); setUser(data.user); navigate("/"); } catch (e) { const m = e?.response?.data?.error || "Registration failed."; toast.error(m); throw new Error(m); } }, [navigate]);
-    const logout = useCallback(async () => { try { await api.post("/api/auth/logout"); } catch {} setUser(null); setProjects([]); setActiveProject(null); serverFilesRef.current = {}; conflictRef.current = null; setConflict(null); setRuntimeError(null); setRepairingRuntime(false); setSaveState("saved"); navigate("/login", { replace: true }); }, [navigate]);
+    const logout = useCallback(async () => { try { await api.post("/api/auth/logout"); } catch {} setUser(null); setProjects([]); setActiveProject(null); serverFilesRef.current = {}; conflictRef.current = null; setConflict(null); setRuntimeError(null); setRepairingRuntime(false); setRuntimeRepairCount(0); setSaveState("saved"); navigate("/login", { replace: true }); }, [navigate]);
     const loadProjects = useCallback(async () => { if (!user) { setProjects([]); setLoadingProjects(false); return; } setLoadingProjects(true); try { const { data } = await api.get("/api/projects"); setProjects(Array.isArray(data) ? data : []); } catch (e) { toast.error(e?.response?.data?.error || "Failed to load projects."); } finally { setLoadingProjects(false); } }, [user]);
     useEffect(() => { loadProjects(); }, [loadProjects]);
-    const loadProject = useCallback(async (id, silent = false) => { if (!user || !id) return null; if (!silent) setLoadingActiveProject(true); try { const { data } = await api.get(`/api/projects/${id}`); adoptServerProject(data); setConflict(null); conflictRef.current = null; setRuntimeError(null); setSaveState("saved"); const paths = Object.keys(data.files || {}); setActiveFile((p) => paths.includes(p) ? p : paths.includes("/App.js") ? "/App.js" : paths[0] || "/App.js"); return data; } catch (e) { if (!silent) { toast.error(e?.response?.data?.error || "Failed to load project."); navigate("/", { replace: true }); } return null; } finally { if (!silent) setLoadingActiveProject(false); } }, [user, navigate, adoptServerProject]);
+    const loadProject = useCallback(async (id, silent = false) => { if (!user || !id) return null; if (!silent) setLoadingActiveProject(true); try { const { data } = await api.get(`/api/projects/${id}`); adoptServerProject(data); setConflict(null); conflictRef.current = null; setRuntimeError(null); setRuntimeRepairCount(0); setRepairingRuntime(false); setSaveState("saved"); const paths = Object.keys(data.files || {}); setActiveFile((p) => paths.includes(p) ? p : paths.includes("/App.js") ? "/App.js" : paths[0] || "/App.js"); return data; } catch (e) { if (!silent) { toast.error(e?.response?.data?.error || "Failed to load project."); navigate("/", { replace: true }); } return null; } finally { if (!silent) setLoadingActiveProject(false); } }, [user, navigate, adoptServerProject]);
     useEffect(() => { if (!user || !activeProject?._id) return; if (!["generating", "pending", "revising"].includes(activeProject.status)) { setChatLoading(false); return; } setChatLoading(true); const id = setInterval(() => loadProject(activeProject._id, true), 2000); return () => clearInterval(id); }, [user, activeProject?._id, activeProject?.status, loadProject]);
     const handleGenerate = useCallback(async (prompt) => { if (!user) return toast.error("Please login first."); if (!prompt?.trim()) return toast.error("Please enter a prompt."); setGeneratingProject(true); try { const { data } = await api.post("/api/projects", { prompt: prompt.trim() }); navigate(`/builder/${data._id}`); } catch (e) { toast.error(e?.response?.data?.error || "Failed to generate project."); } finally { setGeneratingProject(false); } }, [navigate, user]);
     const handleDelete = useCallback(async (id) => { try { await api.delete(`/api/projects/${id}`); setProjects((p) => p.filter((x) => x._id !== id)); } catch (e) { toast.error(e?.response?.data?.error || "Failed to delete project."); } }, []);
@@ -58,17 +59,22 @@ export function AppContextProvider({ children }) {
         const signature = `${activeProject._id}:${activeProject.version}:${error.message}`;
         const now = Date.now();
         if (runtimeRepairRef.current.signature === signature && now - runtimeRepairRef.current.timestamp < 30000) return;
+        const nextCount = runtimeRepairCount + 1;
+        const maxRepairs = 2;
+        if (nextCount > maxRepairs) return;
         runtimeRepairRef.current = { signature, timestamp: now };
+        setRuntimeRepairCount(nextCount);
         setRepairingRuntime(true);
         const prompt = [
             "The generated project has a runtime error in the preview.",
+            `This is automatic repair attempt ${nextCount} of ${maxRepairs}.`,
             "Repair the existing project; do not redesign unrelated parts.",
             `Runtime error: ${error.message}`,
             error.stack ? `Stack trace:\n${error.stack}` : "",
             "Identify the smallest relevant set of files, preserve the current UI and behavior, and fix the root cause."
         ].filter(Boolean).join("\n\n");
         handleChat(prompt).finally(() => setRepairingRuntime(false));
-    }, [activeProject, chatLoading, repairingRuntime, handleChat]);
+    }, [activeProject, chatLoading, repairingRuntime, runtimeRepairCount, handleChat]);
 
     const debouncedSave = useMemo(() => debounce(async (patches, id, version, baseFiles, localFiles) => {
         try { const { data } = await api.patch(`/api/projects/${id}/files`, { patches, version }); adoptServerProject(data); setSaveState("saved"); }
@@ -119,7 +125,7 @@ export function AppContextProvider({ children }) {
         catch (e) { setSaveState(e.response?.status === 409 ? "conflict" : "error"); if (e.response?.status !== 409) toast.error(e?.response?.data?.error || "Failed to save resolution."); }
     }, [adoptServerProject]);
 
-    const value = { user, loadingUser, login, register, logout, projects, loadingProjects, activeProject, loadingActiveProject, chatLoading, generatingProject, activeFile, setActiveFile, showCode, setShowCode, saveState, conflict, runtimeError, repairingRuntime, loadProjects, loadProject, handleGenerate, handleDelete, updateProjectFiles, handleChat, resolveConflict, reportRuntimeError };
+    const value = { user, loadingUser, login, register, logout, projects, loadingProjects, activeProject, loadingActiveProject, chatLoading, generatingProject, activeFile, setActiveFile, showCode, setShowCode, saveState, conflict, runtimeError, repairingRuntime, runtimeRepairCount, loadProjects, loadProject, handleGenerate, handleDelete, updateProjectFiles, handleChat, resolveConflict, reportRuntimeError };
     return <AppContext.Provider value={value}>{children}</AppContext.Provider>;
 }
 export function useAppContext() { const context = useContext(AppContext); if (!context) throw new Error("useAppContext must be used within an AppContextProvider."); return context; }
