@@ -4,6 +4,7 @@ import { useAppContext } from '../context/AppContext';
 import api from '../api/api';
 
 const NETWORK_MARKERS = ["Failed to fetch", "col.csbops.io", "ERR_CONNECTION_TIMED_OUT", "net::ERR", "NetworkError"];
+const SUCCESS_SETTLE_MS = 1200;
 function normalizeError(error) { if (!error) return null; const message = String(error.message || error.toString?.() || error); return { message, stack: error.stack ? String(error.stack) : "" }; }
 
 const SandpackErrorMonitor = ({ onErrorChange }) => {
@@ -11,7 +12,6 @@ const SandpackErrorMonitor = ({ onErrorChange }) => {
     const { error } = sandpack;
     const { reportRuntimeError, activeProject } = useAppContext();
     const lastReportedRef = useRef("");
-    const runtimeStateRef = useRef("pending");
     const reportedVersionRef = useRef("");
 
     useEffect(() => {
@@ -22,30 +22,32 @@ const SandpackErrorMonitor = ({ onErrorChange }) => {
 
         if (!normalized) {
             onErrorChange(true);
-            // Sandpack has mounted without an application error. Report one
-            // successful runtime result per project version so new revisions
-            // can become verified without first having to fail.
-            if (versionKey && reportedVersionRef.current !== versionKey) {
-                runtimeStateRef.current = "passed";
+            if (!versionKey || reportedVersionRef.current === versionKey) return undefined;
+            // Wait for the preview to settle before accepting the absence of an
+            // error as a successful runtime verification.
+            const timer = setTimeout(() => {
+                if (reportedVersionRef.current === versionKey) return;
                 reportedVersionRef.current = versionKey;
-                api.post(`/api/projects/${projectId}/verification/runtime`, { status: "passed" }).catch(() => {});
-            }
-            return;
+                api.post(`/api/projects/${projectId}/verification/runtime`, { status: "passed" }).catch(() => {
+                    if (reportedVersionRef.current === versionKey) reportedVersionRef.current = "";
+                });
+            }, SUCCESS_SETTLE_MS);
+            return () => clearTimeout(timer);
         }
 
         const isNetworkError = NETWORK_MARKERS.some((marker) => normalized.message.includes(marker));
         onErrorChange(!isNetworkError);
-        if (isNetworkError) return;
+        if (isNetworkError) return undefined;
 
         const signature = `${projectId || "unknown"}:${version ?? "unknown"}:${normalized.message}\n${normalized.stack}`;
-        if (signature === lastReportedRef.current) return;
+        if (signature === lastReportedRef.current) return undefined;
         lastReportedRef.current = signature;
-        runtimeStateRef.current = "failed";
         if (projectId) {
             reportedVersionRef.current = versionKey;
             api.post(`/api/projects/${projectId}/verification/runtime`, { status: "failed", error: normalized.message }).catch(() => {});
         }
         reportRuntimeError?.({ ...normalized, source: "sandpack" });
+        return undefined;
     }, [error, onErrorChange, reportRuntimeError, activeProject?._id, activeProject?.version]);
 
     return null;
