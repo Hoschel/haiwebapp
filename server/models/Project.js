@@ -13,25 +13,36 @@ const PlannedFileSchema = new Schema({
     imports: { type: [String], default: [] },
 }, { _id: false });
 
+const VerificationSchema = new Schema({
+    status: { type: String, enum: ["pending_runtime", "verified", "failed"], default: "pending_runtime" },
+    static: {
+        status: { type: String, enum: ["passed", "failed"], default: "passed" },
+        checkedAt: { type: Date, default: null },
+        errors: { type: [String], default: [] },
+        unresolvedImports: { type: [Schema.Types.Mixed], default: [] },
+        syntaxErrors: { type: [Schema.Types.Mixed], default: [] },
+    },
+    runtime: {
+        status: { type: String, enum: ["pending", "passed", "failed"], default: "pending" },
+        checkedAt: { type: Date, default: null },
+        error: { type: String, default: null },
+    },
+}, { _id: false });
+
 const ProjectSchema = new Schema({
     name: { type: String, required: true, default: "Untitled Project", trim: true },
     description: { type: String, default: "" },
-    // File paths contain dots (for example /App.js), so a Mixed object is used
-    // instead of a Mongoose Map whose keys cannot safely be addressed with dotted paths.
     files: { type: Schema.Types.Mixed, default: {} },
     messages: { type: [MessageSchema], default: [] },
     version: { type: Number, default: 0, min: 0 },
     owner: { type: Schema.Types.ObjectId, ref: "User", required: true, index: true },
     published: { type: Boolean, default: false },
-    status: {
-        type: String,
-        enum: ["pending", "generating", "revising", "completed", "failed"],
-        default: "pending",
-    },
+    status: { type: String, enum: ["pending", "generating", "revising", "completed", "failed"], default: "pending" },
     filesPlanned: { type: [PlannedFileSchema], default: [] },
     filesGenerated: { type: [String], default: [] },
     currentFile: { type: String, default: null },
     error: { type: String, default: null },
+    verification: { type: VerificationSchema, default: () => ({}) },
 }, {
     timestamps: true,
     optimisticConcurrency: true,
