@@ -1,6 +1,7 @@
 import { Project } from "../models/Project.js";
 import crypto from "crypto";
 import { generateProject, reviseProject } from "../services/ai.js";
+import { verifyProject } from "../services/projectVerification.js";
 
 function hashContent(content) { return crypto.createHash("sha256").update(content).digest("hex").slice(0, 16); }
 function serializeFiles(files) {
@@ -99,7 +100,6 @@ export async function patchProjectFiles(req, res) {
         const baseHash = patch.baseHash ?? null;
         if (currentHash !== baseHash) conflicts.push({ path, reason: "file_changed", expectedHash: baseHash, currentHash });
     }
-    // Project version can advance because an unrelated file changed. File hashes are the actual conflict boundary.
     if (conflicts.length) return res.status(409).json({ error: "One or more edited files changed on the server.", conflicts, project: projectResponse(project) });
     for (const patch of patches) {
         const path = normalizePath(patch.path);
@@ -150,5 +150,16 @@ export async function chatProject(req, res) {
     }
 }
 
-export async function publishProject(req, res) { if (!req.user) return res.status(401).json({ error: "Unauthorized" }); const project = await Project.findOneAndUpdate({ _id: req.params.id, owner: req.user.userId }, { $set: { published: true } }, { new: true }); if (!project) return res.status(404).json({ error: "Project not found" }); return res.json({ success: true, published: project.published }); }
+export async function publishProject(req, res) {
+    if (!req.user) return res.status(401).json({ error: "Unauthorized" });
+    const project = await Project.findOne({ _id: req.params.id, owner: req.user.userId });
+    if (!project) return res.status(404).json({ error: "Project not found" });
+    const verification = verifyProject(serializeFiles(project.files), project.verification?.runtime || {});
+    if (verification.status !== "verified") {
+        return res.status(409).json({ error: "Project must pass syntax, dependency, and runtime verification before publishing.", verification });
+    }
+    project.published = true;
+    await project.save();
+    return res.json({ success: true, published: project.published, verification });
+}
 export async function getPublicProject(req, res) { const project = await Project.findById(req.params.id); if (!project) return res.status(404).json({ error: "Project not found" }); if (!project.published) return res.status(403).json({ error: "Project is not published yet" }); return res.json({ _id: project._id, name: project.name, description: project.description, files: serializeFiles(project.files), fileHashes: serializeFileHashes(project.files), version: project.version }); }
