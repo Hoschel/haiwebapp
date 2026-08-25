@@ -3,6 +3,7 @@ import { SandpackCodeEditor, SandpackLayout, SandpackPreview, SandpackProvider, 
 import { detectDependencies } from '../utils/sandpackUtils';
 import { useAppContext } from '../context/AppContext';
 import SandpackErrorMonitor from './SandpackErrorMonitor';
+import ConflictResolutionBar from './ConflictResolutionBar';
 
 function SandpackFileWatches({ onLiveFilesChange }) {
     const { sandpack } = useSandpack();
@@ -21,39 +22,21 @@ function SandpackFileWatches({ onLiveFilesChange }) {
     useEffect(() => {
         const project = projectRef.current;
         if (!project || !files) return;
-
         const updatedFiles = {};
-        for (const [path, fileObj] of Object.entries(files)) {
-            updatedFiles[path] = typeof fileObj === "string" ? fileObj : fileObj?.code || "";
-        }
-
+        for (const [path, fileObj] of Object.entries(files)) updatedFiles[path] = typeof fileObj === "string" ? fileObj : fileObj?.code || "";
         onLiveFilesChange(updatedFiles);
-
-        // Sandpack emits its initial file map immediately after mount. Never
-        // treat that initial hydration as a user edit and never write it back.
         const serialized = JSON.stringify(updatedFiles);
-        if (!initializedRef.current) {
-            initializedRef.current = true;
-            lastSentRef.current = serialized;
-            return;
-        }
+        if (!initializedRef.current) { initializedRef.current = true; lastSentRef.current = serialized; return; }
         if (serialized === lastSentRef.current) return;
         lastSentRef.current = serialized;
-
         const projectFiles = project.files || {};
-        let hasChanges = false;
-        for (const [path, code] of Object.entries(updatedFiles)) {
+        let hasChanges = Object.keys(updatedFiles).length !== Object.keys(projectFiles).length;
+        if (!hasChanges) for (const [path, code] of Object.entries(updatedFiles)) {
             const original = typeof projectFiles[path] === "string" ? projectFiles[path] : projectFiles[path]?.content;
-            if (original !== code) {
-                hasChanges = true;
-                break;
-            }
+            if (original !== code) { hasChanges = true; break; }
         }
-        if (Object.keys(updatedFiles).length !== Object.keys(projectFiles).length) hasChanges = true;
-
         if (hasChanges) updateProjectFiles(updatedFiles);
     }, [files, onLiveFilesChange, updateProjectFiles]);
-
     return null;
 }
 
@@ -62,63 +45,15 @@ const PreviewPanel = ({ project, activeFile, showCode }) => {
     const [liveFiles, setLiveFiles] = useState(project.files || {});
     const projectKey = `${project._id}-${project.version}`;
     const projectKeyRef = useRef(projectKey);
-
-    useEffect(() => {
-        if (projectKeyRef.current === projectKey) return;
-        projectKeyRef.current = projectKey;
-        setLiveFiles(project.files || {});
-    }, [projectKey, project.files]);
-
-    const handleLiveFilesChange = useCallback((newFiles) => {
-        setLiveFiles((previous) => {
-            const previousPaths = Object.keys(previous);
-            const nextPaths = Object.keys(newFiles);
-            if (previousPaths.length !== nextPaths.length || previousPaths.some((path) => previous[path] !== newFiles[path])) return newFiles;
-            return previous;
-        });
-    }, []);
-
-    const sandpackFiles = useMemo(() => {
-        const result = {};
-        for (const [path, content] of Object.entries(liveFiles)) {
-            result[path] = {
-                code: typeof content === "string" ? content : content?.content || "",
-                active: path === activeFile,
-            };
-        }
-        return result;
-    }, [liveFiles, activeFile]);
-
+    useEffect(() => { if (projectKeyRef.current !== projectKey) { projectKeyRef.current = projectKey; setLiveFiles(project.files || {}); } }, [projectKey, project.files]);
+    const handleLiveFilesChange = useCallback((newFiles) => setLiveFiles((previous) => JSON.stringify(previous) === JSON.stringify(newFiles) ? previous : newFiles), []);
+    const sandpackFiles = useMemo(() => Object.fromEntries(Object.entries(liveFiles).map(([path, content]) => [path, { code: typeof content === "string" ? content : content?.content || "", active: path === activeFile }])), [liveFiles, activeFile]);
     const dependencies = useMemo(() => detectDependencies(liveFiles), [liveFiles]);
 
     return (
-        <div className='h-full w-full'>
-            <SandpackProvider
-                key={projectKey}
-                template='react'
-                files={sandpackFiles}
-                customSetup={{ dependencies }}
-                options={{
-                    externalResources: [
-                        "https://cdn.tailwindcss.com",
-                        "https://cdnjs.cloudflare.com/ajax/libs/font-awesome/7.3.1/css/all.min.css"
-                    ],
-                    classes: {
-                        "sp-wrapper": "sp-wrapper",
-                        "sp-layout": "sp-layout",
-                        "sp-preview": "sp-preview",
-                    },
-                    logLevel: 0,
-                }}
-                theme={{
-                    colors: {
-                        surface1: "#ffffff", surface2: "#f4f4f5", surface3: "#e4e4e7",
-                        clickable: "#71717a", base: "#09090b", disabled: "#a1a1aa",
-                        hover: "#18181b", accent: "#18181b", error: "#ef4444", errorSurface: "#fef2f2",
-                    },
-                    font: { body: "'Urbanist', system-ui, -apple-system, sans-serif", mono: "'Geist Mono', ui-monospace, monospace", size: "13px", lineHeight: "1.6" }
-                }}
-            >
+        <div className='relative h-full w-full'>
+            <ConflictResolutionBar />
+            <SandpackProvider key={projectKey} template='react' files={sandpackFiles} customSetup={{ dependencies }} options={{ externalResources: ["https://cdn.tailwindcss.com", "https://cdnjs.cloudflare.com/ajax/libs/font-awesome/7.3.1/css/all.min.css"], classes: { "sp-wrapper": "sp-wrapper", "sp-layout": "sp-layout", "sp-preview": "sp-preview" }, logLevel: 0 }} theme={{ colors: { surface1: "#ffffff", surface2: "#f4f4f5", surface3: "#e4e4e7", clickable: "#71717a", base: "#09090b", disabled: "#a1a1aa", hover: "#18181b", accent: "#18181b", error: "#ef4444", errorSurface: "#fef2f2" }, font: { body: "'Urbanist', system-ui, -apple-system, sans-serif", mono: "'Geist Mono', ui-monospace, monospace", size: "13px", lineHeight: "1.6" } }}>
                 <SandpackFileWatches onLiveFilesChange={handleLiveFilesChange} />
                 <SandpackErrorMonitor onErrorChange={setShowErrorOverlay} />
                 <SandpackLayout style={{ height: "100%", border: "none", borderRadius: 0, background: "transparent" }}>
@@ -129,5 +64,4 @@ const PreviewPanel = ({ project, activeFile, showCode }) => {
         </div>
     );
 };
-
 export default PreviewPanel;
