@@ -4,7 +4,11 @@ export function verifyProject(files, runtime = {}, version = null) {
     const integrity = analyzeProjectIntegrity(files);
     const criticalErrors = getCriticalIntegrityErrors(integrity);
     const staticStatus = integrity.ok ? "passed" : "failed";
-    const runtimeMatchesVersion = version == null || runtime.version === version;
+    // A passed runtime result without a persisted version is never trusted.
+    // When the caller supplies the project version, require an exact match;
+    // when it does not (for example legacy publish callers), require at least
+    // a versioned runtime result rather than accepting old unversioned data.
+    const runtimeMatchesVersion = version == null ? Number.isInteger(runtime.version) : runtime.version === version;
     const runtimeStatus = runtimeMatchesVersion ? (runtime.status || "pending") : "pending";
     const runtimeOk = runtimeStatus !== "failed";
     return {
