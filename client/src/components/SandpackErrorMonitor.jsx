@@ -12,27 +12,42 @@ const SandpackErrorMonitor = ({ onErrorChange }) => {
     const { reportRuntimeError, activeProject } = useAppContext();
     const lastReportedRef = useRef("");
     const runtimeStateRef = useRef("pending");
+    const reportedVersionRef = useRef("");
 
     useEffect(() => {
         const normalized = normalizeError(error);
+        const projectId = activeProject?._id;
+        const version = activeProject?.version;
+        const versionKey = projectId != null && version != null ? `${projectId}:${version}` : "";
+
         if (!normalized) {
             onErrorChange(true);
-            if (runtimeStateRef.current === "failed" && activeProject?._id) {
+            // Sandpack has mounted without an application error. Report one
+            // successful runtime result per project version so new revisions
+            // can become verified without first having to fail.
+            if (versionKey && reportedVersionRef.current !== versionKey) {
                 runtimeStateRef.current = "passed";
-                api.post(`/api/projects/${activeProject._id}/verification/runtime`, { status: "passed" }).catch(() => {});
+                reportedVersionRef.current = versionKey;
+                api.post(`/api/projects/${projectId}/verification/runtime`, { status: "passed" }).catch(() => {});
             }
             return;
         }
+
         const isNetworkError = NETWORK_MARKERS.some((marker) => normalized.message.includes(marker));
         onErrorChange(!isNetworkError);
         if (isNetworkError) return;
-        const signature = `${activeProject?._id || "unknown"}:${normalized.message}\n${normalized.stack}`;
+
+        const signature = `${projectId || "unknown"}:${version ?? "unknown"}:${normalized.message}\n${normalized.stack}`;
         if (signature === lastReportedRef.current) return;
         lastReportedRef.current = signature;
         runtimeStateRef.current = "failed";
-        if (activeProject?._id) api.post(`/api/projects/${activeProject._id}/verification/runtime`, { status: "failed", error: normalized.message }).catch(() => {});
+        if (projectId) {
+            reportedVersionRef.current = versionKey;
+            api.post(`/api/projects/${projectId}/verification/runtime`, { status: "failed", error: normalized.message }).catch(() => {});
+        }
         reportRuntimeError?.({ ...normalized, source: "sandpack" });
-    }, [error, onErrorChange, reportRuntimeError, activeProject?._id]);
+    }, [error, onErrorChange, reportRuntimeError, activeProject?._id, activeProject?.version]);
+
     return null;
 };
 export default SandpackErrorMonitor;
