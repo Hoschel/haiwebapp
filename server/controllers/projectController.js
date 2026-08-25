@@ -1,6 +1,6 @@
 import { Project } from "../models/Project.js";
 import crypto from "crypto";
-import { generateProject } from "../services/ai.js";
+import { generateProject, reviseProject } from "../services/ai.js";
 
 function hashContent(content) {
     return crypto.createHash("sha256").update(content).digest("hex").slice(0, 16);
@@ -9,8 +9,17 @@ function hashContent(content) {
 function serializeFiles(files) {
     const result = {};
     if (!files) return result;
-    const entries = files instanceof Map ? files.entries() : Object.entries(files);
-    for (const [path, entry] of entries) result[path] = typeof entry === "string" ? entry : entry?.content || "";
+    for (const [path, entry] of Object.entries(files)) result[path] = typeof entry === "string" ? entry : entry?.content || "";
+    return result;
+}
+
+function serializeFileHashes(files) {
+    const result = {};
+    if (!files) return result;
+    for (const [path, entry] of Object.entries(files)) {
+        const content = typeof entry === "string" ? entry : entry?.content || "";
+        result[path] = typeof entry === "object" && entry?.hash ? entry.hash : hashContent(content);
+    }
     return result;
 }
 
@@ -20,6 +29,7 @@ function projectResponse(project, extra = {}) {
         name: project.name,
         description: project.description,
         files: serializeFiles(project.files),
+        fileHashes: serializeFileHashes(project.files),
         messages: project.messages,
         version: project.version,
         status: project.status,
@@ -41,19 +51,14 @@ async function updateGeneratedFile(projectId, path, code, retries = 5) {
         const project = await Project.findById(projectId);
         if (!project) throw new Error("Project no longer exists");
         if (["failed", "completed"].includes(project.status)) return;
-
         const normalizedPath = normalizePath(path);
-        project.files.set(normalizedPath, { content: code, hash: hashContent(code) });
+        project.files = project.files || {};
+        project.files[normalizedPath] = { content: code, hash: hashContent(code) };
         project.filesGenerated = [...new Set([...(project.filesGenerated || []), normalizedPath])];
         project.messages.push({ role: "assistant", content: `Created file "${normalizedPath}"`, timestamp: new Date() });
         project.currentFile = null;
-
-        try {
-            await project.save();
-            return;
-        } catch (error) {
-            if (error?.name !== "VersionError" || attempt === retries - 1) throw error;
-        }
+        try { await project.save(); return; }
+        catch (error) { if (error?.name !== "VersionError" || attempt === retries - 1) throw error; }
     }
 }
 
@@ -61,14 +66,8 @@ export async function createProject(req, res) {
     const { prompt } = req.body;
     if (!prompt || typeof prompt !== "string" || !prompt.trim()) return res.status(400).json({ error: "prompt is required" });
     if (!req.user) return res.status(401).json({ error: "Unauthorized" });
-
     const cleanPrompt = prompt.trim();
-    const project = await Project.create({
-        name: "Planning project...", description: cleanPrompt, files: new Map(),
-        messages: [{ role: "user", content: cleanPrompt }, { role: "assistant", content: "Planning project structure..." }],
-        owner: req.user.userId, status: "pending",
-    });
-
+    const project = await Project.create({ name: "Planning project...", description: cleanPrompt, files: {}, messages: [{ role: "user", content: cleanPrompt }, { role: "assistant", content: "Planning project structure..." }], owner: req.user.userId, status: "pending" });
     runBackgroundGeneration(project._id.toString(), cleanPrompt).catch((err) => console.error(`[Background AI] Fatal generation error for ${project._id}:`, err));
     return res.status(201).json(projectResponse(project));
 }
@@ -78,33 +77,21 @@ async function runBackgroundGeneration(projectId, prompt) {
         const result = await generateProject(prompt, {
             onPlan: async (plan) => {
                 const fileList = plan.files.map((file) => `- \`${file.path}\`: ${file.description}`).join("\n");
-                await Project.findByIdAndUpdate(projectId, {
-                    $set: { name: plan.projectName || "Generated Project", status: "generating", filesPlanned: plan.files, error: null },
-                    $push: { messages: { role: "assistant", content: `Planned website structure:\n${fileList}`, timestamp: new Date() } },
-                });
+                await Project.findByIdAndUpdate(projectId, { $set: { name: plan.projectName || "Generated Project", status: "generating", filesPlanned: plan.files, error: null }, $push: { messages: { role: "assistant", content: `Planned website structure:\n${fileList}`, timestamp: new Date() } } });
             },
             onFileStart: async (path) => Project.findByIdAndUpdate(projectId, { $set: { currentFile: normalizePath(path) } }),
             onFileComplete: async (path, code) => updateGeneratedFile(projectId, path, code),
         });
-
-        await Project.findByIdAndUpdate(projectId, {
-            $set: { status: "completed", currentFile: null, error: null, ...(result.description ? { name: result.description } : {}) },
-            $inc: { version: 1 },
-            $push: { messages: { role: "assistant", content: "Website generation complete! You can view and edit the files.", timestamp: new Date() } },
-        });
+        await Project.findByIdAndUpdate(projectId, { $set: { status: "completed", currentFile: null, error: null, ...(result.description ? { name: result.description } : {}) }, $inc: { version: 1 }, $push: { messages: { role: "assistant", content: "Website generation complete! You can view and edit the files.", timestamp: new Date() } } });
     } catch (err) {
         console.error(`[Background AI] Fatal generation error for ${projectId}:`, err);
-        await Project.findByIdAndUpdate(projectId, {
-            $set: { status: "failed", currentFile: null, error: err.message || "Generation failed" },
-            $push: { messages: { role: "assistant", content: `Generation failed: ${err.message || "Unknown error"}`, timestamp: new Date() } },
-        });
+        await Project.findByIdAndUpdate(projectId, { $set: { status: "failed", currentFile: null, error: err.message || "Generation failed" }, $push: { messages: { role: "assistant", content: `Generation failed: ${err.message || "Unknown error"}`, timestamp: new Date() } } });
     }
 }
 
 export async function listProjects(req, res) {
     if (!req.user) return res.status(401).json({ error: "Unauthorized" });
-    const projects = await Project.find({ owner: req.user.userId }, { name: 1, description: 1, version: 1, status: 1, published: 1, createdAt: 1, updatedAt: 1 }).sort({ updatedAt: -1 });
-    return res.json(projects);
+    return res.json(await Project.find({ owner: req.user.userId }, { name: 1, description: 1, version: 1, status: 1, published: 1, createdAt: 1, updatedAt: 1 }).sort({ updatedAt: -1 }));
 }
 
 export async function getProject(req, res) {
@@ -126,18 +113,9 @@ export async function updateProjectFiles(req, res) {
     if (!files || typeof files !== "object" || Array.isArray(files)) return res.status(400).json({ error: "files object is required" });
     if (!Number.isInteger(version) || version < 0) return res.status(400).json({ error: "A valid project version is required" });
     if (!req.user) return res.status(401).json({ error: "Unauthorized" });
-
-    const newFiles = new Map();
-    for (const [path, content] of Object.entries(files)) {
-        if (typeof content === "string" && path.startsWith("/")) newFiles.set(path, { content, hash: hashContent(content) });
-    }
-
-    const project = await Project.findOneAndUpdate(
-        { _id: req.params.id, owner: req.user.userId, version },
-        { $set: { files: newFiles }, $inc: { version: 1 } },
-        { new: true, runValidators: true },
-    );
-
+    const newFiles = {};
+    for (const [path, content] of Object.entries(files)) if (typeof content === "string" && path.startsWith("/")) newFiles[path] = { content, hash: hashContent(content) };
+    const project = await Project.findOneAndUpdate({ _id: req.params.id, owner: req.user.userId, version }, { $set: { files: newFiles }, $inc: { version: 1 } }, { new: true, runValidators: true });
     if (!project) {
         const exists = await Project.exists({ _id: req.params.id, owner: req.user.userId });
         if (!exists) return res.status(404).json({ error: "Project not found" });
@@ -145,6 +123,104 @@ export async function updateProjectFiles(req, res) {
         return res.status(409).json({ error: "Project was updated elsewhere. Reload before saving again.", project: latest ? projectResponse(latest) : undefined });
     }
     return res.json(projectResponse(project));
+}
+
+export async function patchProjectFiles(req, res) {
+    const { patches, version } = req.body;
+    if (!req.user) return res.status(401).json({ error: "Unauthorized" });
+    if (!Array.isArray(patches) || !patches.length || patches.length > 100) return res.status(400).json({ error: "patches must contain 1-100 file changes" });
+    if (!Number.isInteger(version) || version < 0) return res.status(400).json({ error: "A valid project version is required" });
+
+    const project = await Project.findOne({ _id: req.params.id, owner: req.user.userId });
+    if (!project) return res.status(404).json({ error: "Project not found" });
+    const files = project.files || {};
+    const conflicts = [];
+
+    for (const patch of patches) {
+        const path = normalizePath(String(patch.path || ""));
+        const currentEntry = files[path];
+        const currentContent = typeof currentEntry === "string" ? currentEntry : currentEntry?.content || "";
+        const currentHash = currentEntry ? (currentEntry?.hash || hashContent(currentContent)) : null;
+        const baseHash = patch.baseHash ?? null;
+        if (currentHash !== baseHash) conflicts.push({ path, reason: "file_changed", expectedHash: baseHash, currentHash });
+    }
+
+    if (project.version !== version) {
+        for (const patch of patches) {
+            if (!conflicts.some((item) => item.path === normalizePath(String(patch.path || "")))) {
+                const path = normalizePath(String(patch.path || ""));
+                conflicts.push({ path, reason: "project_version_changed" });
+            }
+        }
+    }
+
+    if (conflicts.length) return res.status(409).json({ error: "One or more edited files changed on the server.", conflicts, project: projectResponse(project) });
+
+    for (const patch of patches) {
+        const path = normalizePath(String(patch.path || ""));
+        if (patch.op === "delete") delete files[path];
+        else {
+            if (typeof patch.content !== "string") return res.status(400).json({ error: `content is required for ${path}` });
+            files[path] = { content: patch.content, hash: hashContent(patch.content) };
+        }
+    }
+    project.files = files;
+    project.version += 1;
+    project.markModified("files");
+    await project.save();
+    return res.json(projectResponse(project));
+}
+
+export async function chatProject(req, res) {
+    const { prompt } = req.body;
+    if (!req.user) return res.status(401).json({ error: "Unauthorized" });
+    if (!prompt || typeof prompt !== "string" || !prompt.trim()) return res.status(400).json({ error: "prompt is required" });
+    const project = await Project.findOne({ _id: req.params.id, owner: req.user.userId });
+    if (!project) return res.status(404).json({ error: "Project not found" });
+    if (["generating", "pending", "revising"].includes(project.status)) return res.status(409).json({ error: "Project is busy. Wait for the current operation to finish." });
+    const originalVersion = project.version;
+    project.status = "revising";
+    project.error = null;
+    project.messages.push({ role: "user", content: prompt.trim(), timestamp: new Date() });
+    await project.save();
+    try {
+        const manifest = Object.entries(project.files || {}).map(([path, entry]) => ({ path, hash: entry?.hash || hashContent(entry?.content || entry || ""), size: entry?.content?.length || String(entry || "").length }));
+        const relevantFiles = serializeFiles(project.files);
+        const result = await reviseProject(prompt.trim(), manifest, relevantFiles, project.messages.slice(-6));
+        const current = await Project.findOne({ _id: project._id, owner: req.user.userId });
+        if (!current) throw new Error("Project disappeared during revision");
+        const errors = [];
+        for (const operation of result.operations || []) {
+            const path = normalizePath(operation.path);
+            const currentEntry = current.files[path];
+            try {
+                if (operation.op === "create") {
+                    if (currentEntry) throw new Error("File already exists");
+                    current.files[path] = { content: operation.content || "", hash: hashContent(operation.content || "") };
+                } else if (operation.op === "delete") delete current.files[path];
+                else if (operation.op === "update") {
+                    if (!currentEntry) throw new Error("File does not exist");
+                    if (operation.expectedHash && operation.expectedHash !== (currentEntry.hash || hashContent(currentEntry.content || ""))) throw new Error("File changed since revision context was generated");
+                    const content = currentEntry.content || "";
+                    const matches = content.split(operation.search).length - 1;
+                    if (!content.includes(operation.search)) throw new Error("Search text was not found");
+                    if (operation.expectedMatches != null && matches !== operation.expectedMatches) throw new Error(`Expected ${operation.expectedMatches} matches, found ${matches}`);
+                    const next = content.replace(operation.search, operation.replace ?? "");
+                    current.files[path] = { content: next, hash: hashContent(next) };
+                }
+            } catch (error) { errors.push({ path, op: operation.op, error: error.message }); }
+        }
+        current.messages.push({ role: "assistant", content: errors.length ? `Revision completed with ${errors.length} failed operation(s).` : "Revision applied successfully.", timestamp: new Date() });
+        current.status = "completed";
+        current.version += 1;
+        current.markModified("files");
+        await current.save();
+        return res.json(projectResponse(current, { errors }));
+    } catch (error) {
+        const failed = await Project.findById(project._id);
+        if (failed) { failed.status = "failed"; failed.error = error.message || "Revision failed"; await failed.save().catch(() => {}); }
+        return res.status(500).json({ error: error.message || "Revision failed" });
+    }
 }
 
 export async function publishProject(req, res) {
@@ -158,5 +234,5 @@ export async function getPublicProject(req, res) {
     const project = await Project.findById(req.params.id);
     if (!project) return res.status(404).json({ error: "Project not found" });
     if (!project.published) return res.status(403).json({ error: "Project is not published yet" });
-    return res.json({ _id: project._id, name: project.name, description: project.description, files: serializeFiles(project.files), version: project.version });
+    return res.json({ _id: project._id, name: project.name, description: project.description, files: serializeFiles(project.files), fileHashes: serializeFileHashes(project.files), version: project.version });
 }
