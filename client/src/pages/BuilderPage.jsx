@@ -10,6 +10,7 @@ import PreviewPanel from '../components/PreviewPanel';
 import AgentProgressDashboard from '../components/AgentProgressDashboard';
 import RuntimeRepairProgress from '../components/RuntimeRepairProgress';
 import PublishModel from '../components/PublishModel';
+import VerificationStatus from '../components/VerificationStatus';
 import api from '../api/api';
 import toast from 'react-hot-toast';
 import { exportProjectZip } from '../utils/exportProject';
@@ -65,6 +66,7 @@ const BuilderPage = () => {
         <div className='flex-1 overflow-hidden relative'>
           {isGenerating || activeProject.status === "failed" ? <AgentProgressDashboard project={activeProject} /> : <PreviewPanel project={activeProject} activeFile={activeFile} showCode={showCode} />}
           {showRepairOverlay && <RuntimeRepairProgress active={repairingRuntime} attempt={runtimeRepairCount} error={runtimeError} phase={effectiveRepairPhase} />}
+          {!isGenerating && activeProject.status !== "failed" && <VerificationStatus projectId={activeProject._id} version={activeProject.version} compact={false} />}
         </div>
       </div>
       {publishUrl && <PublishModel publishUrl={publishUrl} onClose={() => setPublishUrl(null)} />}
