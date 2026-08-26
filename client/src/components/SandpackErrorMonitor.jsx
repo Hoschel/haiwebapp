@@ -19,16 +19,15 @@ const SandpackErrorMonitor = ({ onErrorChange }) => {
         const projectId = activeProject?._id;
         const version = activeProject?.version;
         const versionKey = projectId != null && version != null ? `${projectId}:${version}` : "";
+        if (!Number.isInteger(version)) return undefined;
 
         if (!normalized) {
             onErrorChange(true);
             if (!versionKey || reportedVersionRef.current === versionKey) return undefined;
-            // Wait for the preview to settle before accepting the absence of an
-            // error as a successful runtime verification.
             const timer = setTimeout(() => {
                 if (reportedVersionRef.current === versionKey) return;
                 reportedVersionRef.current = versionKey;
-                api.post(`/api/projects/${projectId}/verification/runtime`, { status: "passed" }).catch(() => {
+                api.post(`/api/projects/${projectId}/verification/runtime`, { status: "passed", version }).catch(() => {
                     if (reportedVersionRef.current === versionKey) reportedVersionRef.current = "";
                 });
             }, SUCCESS_SETTLE_MS);
@@ -39,12 +38,12 @@ const SandpackErrorMonitor = ({ onErrorChange }) => {
         onErrorChange(!isNetworkError);
         if (isNetworkError) return undefined;
 
-        const signature = `${projectId || "unknown"}:${version ?? "unknown"}:${normalized.message}\n${normalized.stack}`;
+        const signature = `${projectId || "unknown"}:${version}:${normalized.message}\n${normalized.stack}`;
         if (signature === lastReportedRef.current) return undefined;
         lastReportedRef.current = signature;
         if (projectId) {
             reportedVersionRef.current = versionKey;
-            api.post(`/api/projects/${projectId}/verification/runtime`, { status: "failed", error: normalized.message }).catch(() => {});
+            api.post(`/api/projects/${projectId}/verification/runtime`, { status: "failed", error: normalized.message, version }).catch(() => {});
         }
         reportRuntimeError?.({ ...normalized, source: "sandpack" });
         return undefined;
