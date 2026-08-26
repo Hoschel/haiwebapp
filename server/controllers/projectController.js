@@ -8,6 +8,7 @@ function serializeFiles(files) { const result = {}; for (const [path, entry] of 
 function serializeFileHashes(files) { const result = {}; for (const [path, entry] of Object.entries(files || {})) { const content = typeof entry === "string" ? entry : entry?.content || ""; result[path] = typeof entry === "object" && entry?.hash ? entry.hash : hashContent(content); } return result; }
 function projectResponse(project, extra = {}) { return { _id: project._id, name: project.name, description: project.description, files: serializeFiles(project.files), fileHashes: serializeFileHashes(project.files), messages: project.messages, version: project.version, status: project.status, generationStage: project.generationStage, filesPlanned: project.filesPlanned, filesGenerated: project.filesGenerated, currentFile: project.currentFile, error: project.error, published: project.published, verification: project.verification, createdAt: project.createdAt, updatedAt: project.updatedAt, ...extra }; }
 function normalizePath(path) { return path.startsWith("/") ? path : `/${path}`; }
+function pendingVerification(files, version) { return verifyProject(serializeFiles(files), {}, version); }
 
 async function updateGeneratedFile(projectId, path, code, retries = 5) {
     for (let attempt = 0; attempt < retries; attempt += 1) {
@@ -23,9 +24,7 @@ async function updateGeneratedFile(projectId, path, code, retries = 5) {
         try { await project.save(); return; } catch (error) { if (error?.name !== "VersionError" || attempt === retries - 1) throw error; }
     }
 }
-async function setGenerationStage(projectId, stage, extra = {}) {
-    await Project.findByIdAndUpdate(projectId, { $set: { generationStage: stage, ...extra } });
-}
+async function setGenerationStage(projectId, stage, extra = {}) { await Project.findByIdAndUpdate(projectId, { $set: { generationStage: stage, ...extra } }); }
 
 export async function createProject(req, res) {
     const { prompt } = req.body;
@@ -78,7 +77,9 @@ export async function updateProjectFiles(req, res) {
     if (!req.user) return res.status(401).json({ error: "Unauthorized" });
     const newFiles = {};
     for (const [path, content] of Object.entries(files)) if (typeof content === "string" && path.startsWith("/")) newFiles[path] = { content, hash: hashContent(content) };
-    const project = await Project.findOneAndUpdate({ _id: req.params.id, owner: req.user.userId, version }, { $set: { files: newFiles }, $inc: { version: 1 } }, { new: true, runValidators: true });
+    const nextVersion = version + 1;
+    const verification = pendingVerification(newFiles, nextVersion);
+    const project = await Project.findOneAndUpdate({ _id: req.params.id, owner: req.user.userId, version }, { $set: { files: newFiles, verification }, $inc: { version: 1 } }, { new: true, runValidators: true });
     if (!project) { const exists = await Project.exists({ _id: req.params.id, owner: req.user.userId }); if (!exists) return res.status(404).json({ error: "Project not found" }); const latest = await Project.findOne({ _id: req.params.id, owner: req.user.userId }); return res.status(409).json({ error: "Project was updated elsewhere. Reload before saving again.", project: latest ? projectResponse(latest) : undefined }); }
     return res.json(projectResponse(project));
 }
@@ -88,13 +89,17 @@ export async function patchProjectFiles(req, res) {
     if (!req.user) return res.status(401).json({ error: "Unauthorized" });
     if (!Array.isArray(patches) || !patches.length || patches.length > 100) return res.status(400).json({ error: "patches must contain 1-100 file changes" });
     if (!Number.isInteger(version) || version < 0) return res.status(400).json({ error: "A valid project version is required" });
-    const project = await Project.findOne({ _id: req.params.id, owner: req.user.userId });
-    if (!project) return res.status(404).json({ error: "Project not found" });
+    const project = await Project.findOne({ _id: req.params.id, owner: req.user.userId, version });
+    if (!project) { const exists = await Project.exists({ _id: req.params.id, owner: req.user.userId }); return res.status(exists ? 409 : 404).json({ error: exists ? "Project was updated elsewhere. Reload before saving again." : "Project not found" }); }
     const files = { ...(project.files || {}) }, conflicts = [];
     for (const patch of patches) { if (!patch || typeof patch.path !== "string" || !["upsert", "delete"].includes(patch.op)) return res.status(400).json({ error: "Each patch needs path and op=upsert|delete" }); const path = normalizePath(patch.path); const currentEntry = files[path]; const currentContent = typeof currentEntry === "string" ? currentEntry : currentEntry?.content || ""; const currentHash = currentEntry ? (currentEntry?.hash || hashContent(currentContent)) : null; if (currentHash !== (patch.baseHash ?? null)) conflicts.push({ path, reason: "file_changed", expectedHash: patch.baseHash ?? null, currentHash }); }
     if (conflicts.length) return res.status(409).json({ error: "One or more edited files changed on the server.", conflicts, project: projectResponse(project) });
     for (const patch of patches) { const path = normalizePath(patch.path); if (patch.op === "delete") delete files[path]; else { if (typeof patch.content !== "string") return res.status(400).json({ error: `content is required for ${path}` }); files[path] = { content: patch.content, hash: hashContent(patch.content) }; } }
-    project.files = files; project.version = Math.max(project.version, version) + 1; project.markModified("files");
+    const nextVersion = project.version + 1;
+    project.files = files;
+    project.version = nextVersion;
+    project.verification = pendingVerification(files, nextVersion);
+    project.markModified("files"); project.markModified("verification");
     try { await project.save(); } catch (error) { if (error?.name === "VersionError") return res.status(409).json({ error: "Project changed while saving. Retry the file patch.", project: projectResponse(await Project.findById(project._id)) }); throw error; }
     return res.json(projectResponse(project));
 }
@@ -112,7 +117,15 @@ export async function chatProject(req, res) {
         const result = await reviseProject(prompt.trim(), manifest, serializeFiles(project.files), project.messages.slice(-6));
         const current = await Project.findOne({ _id: project._id, owner: req.user.userId }); if (!current) throw new Error("Project disappeared during revision"); const errors = [];
         for (const operation of result.operations || []) { const path = normalizePath(operation.path); const currentEntry = current.files[path]; try { if (operation.op === "create") { if (currentEntry) throw new Error("File already exists"); current.files[path] = { content: operation.content || "", hash: hashContent(operation.content || "") }; } else if (operation.op === "delete") delete current.files[path]; else if (operation.op === "update") { if (!currentEntry) throw new Error("File does not exist"); if (operation.expectedHash && operation.expectedHash !== (currentEntry.hash || hashContent(currentEntry.content || ""))) throw new Error("File changed since revision context was generated"); const content = currentEntry.content || "", matches = content.split(operation.search).length - 1; if (!content.includes(operation.search)) throw new Error("Search text was not found"); if (operation.expectedMatches != null && matches !== operation.expectedMatches) throw new Error(`Expected ${operation.expectedMatches} matches, found ${matches}`); const next = content.replace(operation.search, operation.replace ?? ""); current.files[path] = { content: next, hash: hashContent(next) }; } } catch (error) { errors.push({ path, op: operation.op, error: error.message }); } }
-        current.messages.push({ role: "assistant", content: errors.length ? `Revision completed with ${errors.length} failed operation(s).` : "Revision applied successfully.", timestamp: new Date() }); current.status = "completed"; current.version += 1; current.markModified("files"); await current.save(); return res.json(projectResponse(current, { errors }));
+        const nextVersion = current.version + 1;
+        current.messages.push({ role: "assistant", content: errors.length ? `Revision completed with ${errors.length} failed operation(s).` : "Revision applied successfully.", timestamp: new Date() });
+        current.status = "completed";
+        current.generationStage = "completed";
+        current.version = nextVersion;
+        current.verification = pendingVerification(current.files, nextVersion);
+        current.markModified("files"); current.markModified("verification");
+        await current.save();
+        return res.json(projectResponse(current, { errors }));
     } catch (error) { const failed = await Project.findById(project._id); if (failed) { failed.status = "failed"; failed.error = error.message || "Revision failed"; await failed.save().catch(() => {}); } return res.status(500).json({ error: error.message || "Revision failed" }); }
 }
 
