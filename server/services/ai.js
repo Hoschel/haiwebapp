@@ -17,10 +17,10 @@ const MAX_INTEGRITY_REPAIRS = Math.max(0, Math.min(parseInt(process.env.AI_INTEG
 const MAX_BUILD_REPAIRS = Math.max(0, Math.min(parseInt(process.env.AI_BUILD_REPAIRS || "2", 10) || 2, 3));
 const MAX_REVISION_FILES = Math.max(3, Math.min(parseInt(process.env.AI_REVISION_MAX_FILES || "12", 10) || 12, 30));
 const MAX_REVISION_CONTEXT = Math.max(10000, Math.min(parseInt(process.env.AI_REVISION_MAX_CONTEXT || "50000", 10) || 50000, 100000));
-
 const openrouter = createOpenAI({ baseURL: "https://openrouter.ai/api/v1", apiKey: process.env.OPENROUTER_API_KEY });
 const model = openrouter(MODEL);
 
+async function emitStage(callbacks, stage) { if (callbacks?.onStage) await callbacks.onStage(stage); }
 async function generateSingleFile(file, allFiles, prompt, alreadyGeneratedFiles, extraRepair = "") {
     let repairContext = extraRepair;
     for (let attempt = 0; attempt <= MAX_GENERATION_REPAIRS; attempt += 1) {
@@ -38,67 +38,30 @@ async function generateSingleFile(file, allFiles, prompt, alreadyGeneratedFiles,
     }
     throw new Error("Generation repair loop exhausted");
 }
-
 function normalizePath(path) { return path.startsWith("/") ? path : `/${path}`; }
-function getGenerationPriority(file) {
-    const path = file.path.toLowerCase();
-    if (["/app.js", "/app.jsx", "/styles.css"].includes(path) || path.includes("package.json")) return 0;
-    if (path.includes("/utils/") || path.includes("/hooks/")) return 1;
-    if (path.includes("/components/")) return 2;
-    if (path.includes("/pages/")) return 3;
-    return 2;
-}
-function createFallback(file) {
-    const path = normalizePath(file.path);
-    if (path.endsWith(".css")) return `/* ${file.description || "Generation failed"} */\n`;
-    const safeName = path.split("/").pop()?.replace(/\.[^.]+$/, "") || "Placeholder";
-    const componentName = safeName.replace(/[^a-zA-Z0-9_$]/g, "") || "Placeholder";
-    return `import React from 'react';\n\nexport default function ${componentName}() {\n  return <div className='p-8 text-center text-zinc-400'>Component generation failed. Please retry.</div>;\n}\n`;
-}
+function getGenerationPriority(file) { const path = file.path.toLowerCase(); if (["/app.js", "/app.jsx", "/styles.css"].includes(path) || path.includes("package.json")) return 0; if (path.includes("/utils/") || path.includes("/hooks/")) return 1; if (path.includes("/components/")) return 2; if (path.includes("/pages/")) return 3; return 2; }
+function createFallback(file) { const path = normalizePath(file.path); if (path.endsWith(".css")) return `/* ${file.description || "Generation failed"} */\n`; const safeName = path.split("/").pop()?.replace(/\.[^.]+$/, "") || "Placeholder"; const componentName = safeName.replace(/[^a-zA-Z0-9_$]/g, "") || "Placeholder"; return `import React from 'react';\n\nexport default function ${componentName}() {\n  return <div className='p-8 text-center text-zinc-400'>Component generation failed. Please retry.</div>;\n}\n`; }
 
 async function repairProjectIntegrity(files, plan, prompt, callbacks) {
     let report = analyzeProjectIntegrity(files);
     for (let round = 0; round < MAX_INTEGRITY_REPAIRS && !report.ok; round += 1) {
-        const critical = getCriticalIntegrityErrors(report);
-        if (!critical.length) break;
-        const affected = new Set();
-        for (const item of report.syntaxErrors) affected.add(item.path);
-        for (const item of report.unresolvedImports) affected.add(item.from);
-        const repairFiles = plan.files.filter((file) => affected.has(normalizePath(file.path))).slice(0, 6);
-        if (!repairFiles.length) break;
-        await pMap(repairFiles, async (file) => {
-            try {
-                if (callbacks?.onFileStart) await callbacks.onFileStart(file.path);
-                const errorsForFile = critical.filter((error) => error.startsWith(`${normalizePath(file.path)}:`));
-                const repair = `FINAL PROJECT INTEGRITY REPAIR. The project currently has these issues:\n- ${errorsForFile.join("\n- ")}\nRegenerate this COMPLETE file so its imports and syntax are compatible with the existing project files.`;
-                const result = await generateSingleFile(file, plan.files, prompt, { ...files }, repair);
-                files[normalizePath(result.path)] = result.code;
-                if (callbacks?.onFileComplete) await callbacks.onFileComplete(result.path, result.code);
-            } catch (error) { console.warn(`[AI] Integrity repair failed for ${file.path}: ${error.message}`); }
-        }, { concurrency: Math.min(MAX_CONCURRENCY, 3) });
+        const critical = getCriticalIntegrityErrors(report); if (!critical.length) break;
+        const affected = new Set(); for (const item of report.syntaxErrors) affected.add(item.path); for (const item of report.unresolvedImports) affected.add(item.from);
+        const repairFiles = plan.files.filter((file) => affected.has(normalizePath(file.path))).slice(0, 6); if (!repairFiles.length) break;
+        await pMap(repairFiles, async (file) => { try { if (callbacks?.onFileStart) await callbacks.onFileStart(file.path); const errorsForFile = critical.filter((error) => error.startsWith(`${normalizePath(file.path)}:`)); const repair = `FINAL PROJECT INTEGRITY REPAIR. The project currently has these issues:\n- ${errorsForFile.join("\n- ")}\nRegenerate this COMPLETE file so its imports and syntax are compatible with the existing project files.`; const result = await generateSingleFile(file, plan.files, prompt, { ...files }, repair); files[normalizePath(result.path)] = result.code; if (callbacks?.onFileComplete) await callbacks.onFileComplete(result.path, result.code); } catch (error) { console.warn(`[AI] Integrity repair failed for ${file.path}: ${error.message}`); } }, { concurrency: Math.min(MAX_CONCURRENCY, 3) });
         report = analyzeProjectIntegrity(files);
     }
     return report;
 }
-
 async function repairProjectBuild(files, plan, prompt, callbacks) {
     let report = validateProjectBuild(files);
     for (let round = 0; round < MAX_BUILD_REPAIRS && report.status !== "passed"; round += 1) {
         const affectedPaths = new Set((report.errors || []).map((item) => item?.path).filter(Boolean).map(normalizePath));
         let repairFiles = plan.files.filter((file) => affectedPaths.has(normalizePath(file.path)));
         if (!repairFiles.length) repairFiles = plan.files.filter((file) => ["/App.js", "/App.jsx", "/main.js", "/main.jsx", "/index.js", "/index.jsx"].includes(normalizePath(file.path))).slice(0, 1);
-        repairFiles = repairFiles.slice(0, 6);
-        if (!repairFiles.length) break;
+        repairFiles = repairFiles.slice(0, 6); if (!repairFiles.length) break;
         const details = (report.errors || []).slice(0, 20).map((item) => `${item.path || "project"}: ${item.error || "Build validation failed"}`).join("\n- ");
-        await pMap(repairFiles, async (file) => {
-            try {
-                if (callbacks?.onFileStart) await callbacks.onFileStart(file.path);
-                const repair = `FINAL PROJECT BUILD REPAIR. Build validation failed with:\n- ${details}\nRegenerate this COMPLETE file. Fix the root cause only, preserve the intended UI and existing project architecture, and do not use placeholders or merge markers.`;
-                const result = await generateSingleFile(file, plan.files, prompt, { ...files }, repair);
-                files[normalizePath(result.path)] = result.code;
-                if (callbacks?.onFileComplete) await callbacks.onFileComplete(result.path, result.code);
-            } catch (error) { console.warn(`[AI] Build repair failed for ${file.path}: ${error.message}`); }
-        }, { concurrency: Math.min(MAX_CONCURRENCY, 2) });
+        await pMap(repairFiles, async (file) => { try { if (callbacks?.onFileStart) await callbacks.onFileStart(file.path); const repair = `FINAL PROJECT BUILD REPAIR. Build validation failed with:\n- ${details}\nRegenerate this COMPLETE file. Fix the root cause only, preserve the intended UI and existing project architecture, and do not use placeholders or merge markers.`; const result = await generateSingleFile(file, plan.files, prompt, { ...files }, repair); files[normalizePath(result.path)] = result.code; if (callbacks?.onFileComplete) await callbacks.onFileComplete(result.path, result.code); } catch (error) { console.warn(`[AI] Build repair failed for ${file.path}: ${error.message}`); } }, { concurrency: Math.min(MAX_CONCURRENCY, 2) });
         report = validateProjectBuild(files);
     }
     return report;
@@ -106,77 +69,40 @@ async function repairProjectBuild(files, plan, prompt, callbacks) {
 
 export async function generateProject(prompt, callbacks) {
     if (!process.env.OPENROUTER_API_KEY) throw new Error("OPENROUTER_API_KEY is not configured");
+    await emitStage(callbacks, "planning");
     const { object: plan } = await generateObject({ model, schema: FilePlanSchema, system: FILE_PLAN_SYSTEM, prompt: `Plan a React website for: ${prompt}`, maxRetries: 2 });
     if (!plan.files.find((file) => normalizePath(file.path) === "/App.js")) plan.files.unshift({ path: "/App.js", description: "Main application entry point", exports: "default App", imports: ["./styles.css"] });
     if (!plan.files.find((file) => normalizePath(file.path) === "/styles.css")) plan.files.push({ path: "/styles.css", description: "Global styles", exports: "none", imports: [] });
     if (callbacks?.onPlan) await callbacks.onPlan(plan);
-
-    const files = {};
-    const priorities = [...new Set(plan.files.map(getGenerationPriority))].sort((a, b) => a - b);
+    await emitStage(callbacks, "generating");
+    const files = {}, priorities = [...new Set(plan.files.map(getGenerationPriority))].sort((a, b) => a - b);
     for (const priority of priorities) {
         let pendingFiles = plan.files.filter((file) => getGenerationPriority(file) === priority);
         for (let round = 0; round <= 2 && pendingFiles.length; round += 1) {
-            const results = await pMap(pendingFiles, async (file) => {
-                try {
-                    if (callbacks?.onFileStart) await callbacks.onFileStart(file.path);
-                    const result = await generateSingleFile(file, plan.files, prompt, { ...files });
-                    if (callbacks?.onFileComplete) await callbacks.onFileComplete(file.path, result.code);
-                    return { success: true, file, result };
-                } catch (error) { return { success: false, file, error }; }
-            }, { concurrency: MAX_CONCURRENCY });
-            pendingFiles = [];
-            for (const entry of results) {
-                if (entry.success) files[normalizePath(entry.result.path)] = entry.result.code;
-                else pendingFiles.push(entry.file);
-            }
+            const results = await pMap(pendingFiles, async (file) => { try { if (callbacks?.onFileStart) await callbacks.onFileStart(file.path); const result = await generateSingleFile(file, plan.files, prompt, { ...files }); if (callbacks?.onFileComplete) await callbacks.onFileComplete(file.path, result.code); return { success: true, file, result }; } catch (error) { return { success: false, file, error }; } }, { concurrency: MAX_CONCURRENCY });
+            pendingFiles = []; for (const entry of results) { if (entry.success) files[normalizePath(entry.result.path)] = entry.result.code; else pendingFiles.push(entry.file); }
         }
-        for (const file of pendingFiles) {
-            const path = normalizePath(file.path);
-            files[path] = createFallback(file);
-            if (callbacks?.onFileComplete) await callbacks.onFileComplete(path, files[path]);
-        }
+        for (const file of pendingFiles) { const path = normalizePath(file.path); files[path] = createFallback(file); if (callbacks?.onFileComplete) await callbacks.onFileComplete(path, files[path]); }
     }
     if (!files["/App.js"] && !files["/App.jsx"]) throw new Error("AI did not produce an application entry point");
-
+    await emitStage(callbacks, "validating_integrity");
     const integrity = await repairProjectIntegrity(files, plan, prompt, callbacks);
+    await emitStage(callbacks, "validating_build");
     const build = await repairProjectBuild(files, plan, prompt, callbacks);
+    await emitStage(callbacks, "finalizing");
     const finalIntegrity = analyzeProjectIntegrity(files);
     if (callbacks?.onValidation) await callbacks.onValidation({ type: "project-integrity", report: finalIntegrity });
     if (callbacks?.onValidation) await callbacks.onValidation({ type: "project-build", report: build });
-    if (!finalIntegrity.ok || build.status !== "passed") {
-        const errors = [...getCriticalIntegrityErrors(finalIntegrity), ...(build.errors || []).map((item) => `${item.path || "project"}: ${item.error || "Build validation failed"}`)];
-        throw new Error(`Generated project failed final validation: ${errors.slice(0, 10).join("; ")}`);
-    }
+    if (!finalIntegrity.ok || build.status !== "passed") { const errors = [...getCriticalIntegrityErrors(finalIntegrity), ...(build.errors || []).map((item) => `${item.path || "project"}: ${item.error || "Build validation failed"}`)]; throw new Error(`Generated project failed final validation: ${errors.slice(0, 10).join("; ")}`); }
     return { files, description: plan.projectDescription, dependencyReport: finalIntegrity.dependency, buildReport: build };
 }
 
 export async function reviseProject(prompt, manifest, allFiles, recentMessages) {
-    const graphResult = buildDependencyGraph(allFiles);
-    const selection = selectRelevantFiles(prompt, manifest, allFiles, { maxFiles: MAX_REVISION_FILES, maxCharacters: MAX_REVISION_CONTEXT });
-    const selectedPaths = Object.keys(selection.files);
-    const affectedPaths = getAffectedFiles(graphResult, selectedPaths, { includeDependencies: true, includeDependents: true });
-    const contextPaths = [...new Set([...selectedPaths, ...affectedPaths])].filter((path) => allFiles[path]).slice(0, MAX_REVISION_FILES);
-    const contextFiles = Object.fromEntries(contextPaths.map((path) => [path, allFiles[path]]));
+    const graphResult = buildDependencyGraph(allFiles), selection = selectRelevantFiles(prompt, manifest, allFiles, { maxFiles: MAX_REVISION_FILES, maxCharacters: MAX_REVISION_CONTEXT }), selectedPaths = Object.keys(selection.files), affectedPaths = getAffectedFiles(graphResult, selectedPaths, { includeDependencies: true, includeDependents: true }), contextPaths = [...new Set([...selectedPaths, ...affectedPaths])].filter((path) => allFiles[path]).slice(0, MAX_REVISION_FILES), contextFiles = Object.fromEntries(contextPaths.map((path) => [path, allFiles[path]]));
     const contextParts = ["## Current Project Files (manifest)", "```", ...manifest.map((file) => `${file.path} (${file.hash}, ${file.size}B)`), "```", "\n## Relevant and Dependency-Affected Files", ...Object.entries(contextFiles).map(([path, content]) => `\n### ${path}\n\`\`\`javascript\n${content}\n\`\`\``), `\n## Dependency Report\n${JSON.stringify(getDependencyReport(graphResult))}`];
     if (recentMessages?.length) { contextParts.push("\n## Recent Conversation"); for (const message of recentMessages.slice(-3)) contextParts.push(`${message.role}: ${message.content}`); }
     contextParts.push(`\n## Revision Request\n${prompt}`);
-
     const { object: rawParsed } = await generateObject({ model, schema: RevisionResultSchema, system: REVISE_SYSTEM, prompt: contextParts.join("\n"), maxRetries: 2 });
-    if (rawParsed && Array.isArray(rawParsed.operations)) {
-        rawParsed.operations = rawParsed.operations.map((op) => {
-            if (!op || typeof op !== "object") return op;
-            const opName = String(op.op || "").trim().toLowerCase();
-            if (["create", "add", "new"].includes(opName)) op.op = "create";
-            else if (["update", "edit", "modify", "patch"].includes(opName)) op.op = "update";
-            else if (["delete", "remove", "del", "rm"].includes(opName)) op.op = "delete";
-            if (typeof op.path === "string") op.path = normalizePath(op.path);
-            if (op.content) op.content = normalizeContent(op.content);
-            if (op.search) op.search = normalizeContent(op.search);
-            if (op.replace) op.replace = normalizeContent(op.replace);
-            if (op.op === "create" && op.content) op.content = validateRevisionContent(op.content, op.path, "create").content;
-            else if (op.op === "update" && op.replace) op.replace = validateRevisionContent(op.replace, op.path, "update").content;
-            return op;
-        });
-    }
+    if (rawParsed && Array.isArray(rawParsed.operations)) rawParsed.operations = rawParsed.operations.map((op) => { if (!op || typeof op !== "object") return op; const opName = String(op.op || "").trim().toLowerCase(); if (["create", "add", "new"].includes(opName)) op.op = "create"; else if (["update", "edit", "modify", "patch"].includes(opName)) op.op = "update"; else if (["delete", "remove", "del", "rm"].includes(opName)) op.op = "delete"; if (typeof op.path === "string") op.path = normalizePath(op.path); if (op.content) op.content = normalizeContent(op.content); if (op.search) op.search = normalizeContent(op.search); if (op.replace) op.replace = normalizeContent(op.replace); if (op.op === "create" && op.content) op.content = validateRevisionContent(op.content, op.path, "create").content; else if (op.op === "update" && op.replace) op.replace = validateRevisionContent(op.replace, op.path, "update").content; return op; });
     return rawParsed;
 }
