@@ -14,12 +14,16 @@ export async function getProjectVerification(req, res) {
 }
 
 export async function reportRuntimeVerification(req, res) {
-    const { status, error } = req.body || {};
+    const { status, error, version } = req.body || {};
     if (!req.user) return res.status(401).json({ error: "Unauthorized" });
     if (!["passed", "failed"].includes(status)) return res.status(400).json({ error: "status must be passed or failed" });
+    if (!Number.isInteger(version) || version < 0) return res.status(400).json({ error: "A valid project version is required" });
 
     const project = await Project.findOne({ _id: req.params.id, owner: req.user.userId });
     if (!project) return res.status(404).json({ error: "Project not found" });
+    if (project.version !== version) {
+        return res.status(409).json({ error: "Stale runtime verification ignored. Reload the latest project version.", version: project.version });
+    }
 
     const files = serializeFiles(project.files);
     project.verification = withRuntimeVerification(
@@ -29,8 +33,6 @@ export async function reportRuntimeVerification(req, res) {
         project.version,
     );
 
-    // Initial generation waits here until the preview verifies the exact project version.
-    // Do not advance the stage for failed runtime checks: the repair pipeline may still recover.
     if (status === "passed" && project.verification.status === "verified" && project.generationStage === "awaiting_runtime") {
         project.generationStage = "completed";
         project.status = "completed";
