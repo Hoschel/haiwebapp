@@ -4,24 +4,9 @@ import { generateProject, reviseProject } from "../services/ai.js";
 import { verifyProject } from "../services/projectVerification.js";
 
 function hashContent(content) { return crypto.createHash("sha256").update(content).digest("hex").slice(0, 16); }
-function serializeFiles(files) {
-    const result = {};
-    if (!files) return result;
-    for (const [path, entry] of Object.entries(files)) result[path] = typeof entry === "string" ? entry : entry?.content || "";
-    return result;
-}
-function serializeFileHashes(files) {
-    const result = {};
-    if (!files) return result;
-    for (const [path, entry] of Object.entries(files)) {
-        const content = typeof entry === "string" ? entry : entry?.content || "";
-        result[path] = typeof entry === "object" && entry?.hash ? entry.hash : hashContent(content);
-    }
-    return result;
-}
-function projectResponse(project, extra = {}) {
-    return { _id: project._id, name: project.name, description: project.description, files: serializeFiles(project.files), fileHashes: serializeFileHashes(project.files), messages: project.messages, version: project.version, status: project.status, filesPlanned: project.filesPlanned, filesGenerated: project.filesGenerated, currentFile: project.currentFile, error: project.error, published: project.published, createdAt: project.createdAt, updatedAt: project.updatedAt, ...extra };
-}
+function serializeFiles(files) { const result = {}; for (const [path, entry] of Object.entries(files || {})) result[path] = typeof entry === "string" ? entry : entry?.content || ""; return result; }
+function serializeFileHashes(files) { const result = {}; for (const [path, entry] of Object.entries(files || {})) { const content = typeof entry === "string" ? entry : entry?.content || ""; result[path] = typeof entry === "object" && entry?.hash ? entry.hash : hashContent(content); } return result; }
+function projectResponse(project, extra = {}) { return { _id: project._id, name: project.name, description: project.description, files: serializeFiles(project.files), fileHashes: serializeFileHashes(project.files), messages: project.messages, version: project.version, status: project.status, generationStage: project.generationStage, filesPlanned: project.filesPlanned, filesGenerated: project.filesGenerated, currentFile: project.currentFile, error: project.error, published: project.published, verification: project.verification, createdAt: project.createdAt, updatedAt: project.updatedAt, ...extra }; }
 function normalizePath(path) { return path.startsWith("/") ? path : `/${path}`; }
 
 async function updateGeneratedFile(projectId, path, code, retries = 5) {
@@ -33,10 +18,13 @@ async function updateGeneratedFile(projectId, path, code, retries = 5) {
         project.files = project.files || {};
         project.files[normalizedPath] = { content: code, hash: hashContent(code) };
         project.filesGenerated = [...new Set([...(project.filesGenerated || []), normalizedPath])];
-        project.messages.push({ role: "assistant", content: `Created file "${normalizedPath}"`, timestamp: new Date() });
+        project.messages.push({ role: "assistant", content: `Created file \"${normalizedPath}\"`, timestamp: new Date() });
         project.currentFile = null;
         try { await project.save(); return; } catch (error) { if (error?.name !== "VersionError" || attempt === retries - 1) throw error; }
     }
+}
+async function setGenerationStage(projectId, stage, extra = {}) {
+    await Project.findByIdAndUpdate(projectId, { $set: { generationStage: stage, ...extra } });
 }
 
 export async function createProject(req, res) {
@@ -44,7 +32,7 @@ export async function createProject(req, res) {
     if (!prompt || typeof prompt !== "string" || !prompt.trim()) return res.status(400).json({ error: "prompt is required" });
     if (!req.user) return res.status(401).json({ error: "Unauthorized" });
     const cleanPrompt = prompt.trim();
-    const project = await Project.create({ name: "Planning project...", description: cleanPrompt, files: {}, messages: [{ role: "user", content: cleanPrompt }, { role: "assistant", content: "Planning project structure..." }], owner: req.user.userId, status: "pending" });
+    const project = await Project.create({ name: "Planning project...", description: cleanPrompt, files: {}, messages: [{ role: "user", content: cleanPrompt }, { role: "assistant", content: "Planning project structure..." }], owner: req.user.userId, status: "pending", generationStage: "planning" });
     runBackgroundGeneration(project._id.toString(), cleanPrompt).catch((err) => console.error(`[Background AI] Fatal generation error for ${project._id}:`, err));
     return res.status(201).json(projectResponse(project));
 }
@@ -54,19 +42,32 @@ async function runBackgroundGeneration(projectId, prompt) {
         const result = await generateProject(prompt, {
             onPlan: async (plan) => {
                 const fileList = plan.files.map((file) => `- \`${file.path}\`: ${file.description}`).join("\n");
-                await Project.findByIdAndUpdate(projectId, { $set: { name: plan.projectName || "Generated Project", status: "generating", filesPlanned: plan.files, error: null }, $push: { messages: { role: "assistant", content: `Planned website structure:\n${fileList}`, timestamp: new Date() } } });
+                await Project.findByIdAndUpdate(projectId, { $set: { name: plan.projectName || "Generated Project", status: "generating", generationStage: "generating", filesPlanned: plan.files, error: null }, $push: { messages: { role: "assistant", content: `Planned website structure:\n${fileList}`, timestamp: new Date() } } });
             },
-            onFileStart: async (path) => Project.findByIdAndUpdate(projectId, { $set: { currentFile: normalizePath(path) } }),
+            onStage: async (stage) => setGenerationStage(projectId, stage),
+            onFileStart: async (path) => Project.findByIdAndUpdate(projectId, { $set: { generationStage: "generating", currentFile: normalizePath(path) } }),
             onFileComplete: async (path, code) => updateGeneratedFile(projectId, path, code),
         });
-        await Project.findByIdAndUpdate(projectId, { $set: { status: "completed", currentFile: null, error: null, ...(result.description ? { name: result.description } : {}) }, $inc: { version: 1 }, $push: { messages: { role: "assistant", content: "Website generation complete! You can view and edit the files.", timestamp: new Date() } } });
+        const project = await Project.findById(projectId);
+        if (!project) throw new Error("Project no longer exists after generation");
+        const nextVersion = project.version + 1;
+        const verification = verifyProject(serializeFiles(project.files), {}, nextVersion);
+        project.status = "completed";
+        project.generationStage = "awaiting_runtime";
+        project.currentFile = null;
+        project.error = null;
+        if (result.description) project.name = result.description;
+        project.version = nextVersion;
+        project.verification = verification;
+        project.messages.push({ role: "assistant", content: "Generation passed static and build validation. Waiting for preview runtime verification.", timestamp: new Date() });
+        await project.save();
     } catch (err) {
         console.error(`[Background AI] Fatal generation error for ${projectId}:`, err);
-        await Project.findByIdAndUpdate(projectId, { $set: { status: "failed", currentFile: null, error: err.message || "Generation failed" }, $push: { messages: { role: "assistant", content: `Generation failed: ${err.message || "Unknown error"}`, timestamp: new Date() } } });
+        await Project.findByIdAndUpdate(projectId, { $set: { status: "failed", generationStage: "failed", currentFile: null, error: err.message || "Generation failed" }, $push: { messages: { role: "assistant", content: `Generation failed: ${err.message || "Unknown error"}`, timestamp: new Date() } } });
     }
 }
 
-export async function listProjects(req, res) { if (!req.user) return res.status(401).json({ error: "Unauthorized" }); return res.json(await Project.find({ owner: req.user.userId }, { name: 1, description: 1, version: 1, status: 1, published: 1, createdAt: 1, updatedAt: 1 }).sort({ updatedAt: -1 })); }
+export async function listProjects(req, res) { if (!req.user) return res.status(401).json({ error: "Unauthorized" }); return res.json(await Project.find({ owner: req.user.userId }, { name: 1, description: 1, version: 1, status: 1, generationStage: 1, published: 1, createdAt: 1, updatedAt: 1 }).sort({ updatedAt: -1 })); }
 export async function getProject(req, res) { if (!req.user) return res.status(401).json({ error: "Unauthorized" }); const project = await Project.findOne({ _id: req.params.id, owner: req.user.userId }); if (!project) return res.status(404).json({ error: "Project not found" }); return res.json(projectResponse(project)); }
 export async function deleteProject(req, res) { if (!req.user) return res.status(401).json({ error: "Unauthorized" }); const result = await Project.findOneAndDelete({ _id: req.params.id, owner: req.user.userId }); if (!result) return res.status(404).json({ error: "Project not found" }); return res.json({ success: true }); }
 
@@ -89,28 +90,12 @@ export async function patchProjectFiles(req, res) {
     if (!Number.isInteger(version) || version < 0) return res.status(400).json({ error: "A valid project version is required" });
     const project = await Project.findOne({ _id: req.params.id, owner: req.user.userId });
     if (!project) return res.status(404).json({ error: "Project not found" });
-    const files = { ...(project.files || {}) };
-    const conflicts = [];
-    for (const patch of patches) {
-        if (!patch || typeof patch.path !== "string" || !["upsert", "delete"].includes(patch.op)) return res.status(400).json({ error: "Each patch needs path and op=upsert|delete" });
-        const path = normalizePath(patch.path);
-        const currentEntry = files[path];
-        const currentContent = typeof currentEntry === "string" ? currentEntry : currentEntry?.content || "";
-        const currentHash = currentEntry ? (currentEntry?.hash || hashContent(currentContent)) : null;
-        const baseHash = patch.baseHash ?? null;
-        if (currentHash !== baseHash) conflicts.push({ path, reason: "file_changed", expectedHash: baseHash, currentHash });
-    }
+    const files = { ...(project.files || {}) }, conflicts = [];
+    for (const patch of patches) { if (!patch || typeof patch.path !== "string" || !["upsert", "delete"].includes(patch.op)) return res.status(400).json({ error: "Each patch needs path and op=upsert|delete" }); const path = normalizePath(patch.path); const currentEntry = files[path]; const currentContent = typeof currentEntry === "string" ? currentEntry : currentEntry?.content || ""; const currentHash = currentEntry ? (currentEntry?.hash || hashContent(currentContent)) : null; if (currentHash !== (patch.baseHash ?? null)) conflicts.push({ path, reason: "file_changed", expectedHash: patch.baseHash ?? null, currentHash }); }
     if (conflicts.length) return res.status(409).json({ error: "One or more edited files changed on the server.", conflicts, project: projectResponse(project) });
-    for (const patch of patches) {
-        const path = normalizePath(patch.path);
-        if (patch.op === "delete") delete files[path];
-        else { if (typeof patch.content !== "string") return res.status(400).json({ error: `content is required for ${path}` }); files[path] = { content: patch.content, hash: hashContent(patch.content) }; }
-    }
-    project.files = files;
-    project.version = Math.max(project.version, version) + 1;
-    project.markModified("files");
-    try { await project.save(); }
-    catch (error) { if (error?.name === "VersionError") return res.status(409).json({ error: "Project changed while saving. Retry the file patch.", project: projectResponse(await Project.findById(project._id)) }); throw error; }
+    for (const patch of patches) { const path = normalizePath(patch.path); if (patch.op === "delete") delete files[path]; else { if (typeof patch.content !== "string") return res.status(400).json({ error: `content is required for ${path}` }); files[path] = { content: patch.content, hash: hashContent(patch.content) }; } }
+    project.files = files; project.version = Math.max(project.version, version) + 1; project.markModified("files");
+    try { await project.save(); } catch (error) { if (error?.name === "VersionError") return res.status(409).json({ error: "Project changed while saving. Retry the file patch.", project: projectResponse(await Project.findById(project._id)) }); throw error; }
     return res.json(projectResponse(project));
 }
 
@@ -125,41 +110,11 @@ export async function chatProject(req, res) {
     try {
         const manifest = Object.entries(project.files || {}).map(([path, entry]) => ({ path, hash: entry?.hash || hashContent(entry?.content || entry || ""), size: entry?.content?.length || String(entry || "").length }));
         const result = await reviseProject(prompt.trim(), manifest, serializeFiles(project.files), project.messages.slice(-6));
-        const current = await Project.findOne({ _id: project._id, owner: req.user.userId }); if (!current) throw new Error("Project disappeared during revision");
-        const errors = [];
-        for (const operation of result.operations || []) {
-            const path = normalizePath(operation.path); const currentEntry = current.files[path];
-            try {
-                if (operation.op === "create") { if (currentEntry) throw new Error("File already exists"); current.files[path] = { content: operation.content || "", hash: hashContent(operation.content || "") }; }
-                else if (operation.op === "delete") delete current.files[path];
-                else if (operation.op === "update") {
-                    if (!currentEntry) throw new Error("File does not exist");
-                    if (operation.expectedHash && operation.expectedHash !== (currentEntry.hash || hashContent(currentEntry.content || ""))) throw new Error("File changed since revision context was generated");
-                    const content = currentEntry.content || ""; const matches = content.split(operation.search).length - 1;
-                    if (!content.includes(operation.search)) throw new Error("Search text was not found");
-                    if (operation.expectedMatches != null && matches !== operation.expectedMatches) throw new Error(`Expected ${operation.expectedMatches} matches, found ${matches}`);
-                    const next = content.replace(operation.search, operation.replace ?? ""); current.files[path] = { content: next, hash: hashContent(next) };
-                }
-            } catch (error) { errors.push({ path, op: operation.op, error: error.message }); }
-        }
-        current.messages.push({ role: "assistant", content: errors.length ? `Revision completed with ${errors.length} failed operation(s).` : "Revision applied successfully.", timestamp: new Date() }); current.status = "completed"; current.version += 1; current.markModified("files"); await current.save();
-        return res.json(projectResponse(current, { errors }));
-    } catch (error) {
-        const failed = await Project.findById(project._id); if (failed) { failed.status = "failed"; failed.error = error.message || "Revision failed"; await failed.save().catch(() => {}); }
-        return res.status(500).json({ error: error.message || "Revision failed" });
-    }
+        const current = await Project.findOne({ _id: project._id, owner: req.user.userId }); if (!current) throw new Error("Project disappeared during revision"); const errors = [];
+        for (const operation of result.operations || []) { const path = normalizePath(operation.path); const currentEntry = current.files[path]; try { if (operation.op === "create") { if (currentEntry) throw new Error("File already exists"); current.files[path] = { content: operation.content || "", hash: hashContent(operation.content || "") }; } else if (operation.op === "delete") delete current.files[path]; else if (operation.op === "update") { if (!currentEntry) throw new Error("File does not exist"); if (operation.expectedHash && operation.expectedHash !== (currentEntry.hash || hashContent(currentEntry.content || ""))) throw new Error("File changed since revision context was generated"); const content = currentEntry.content || "", matches = content.split(operation.search).length - 1; if (!content.includes(operation.search)) throw new Error("Search text was not found"); if (operation.expectedMatches != null && matches !== operation.expectedMatches) throw new Error(`Expected ${operation.expectedMatches} matches, found ${matches}`); const next = content.replace(operation.search, operation.replace ?? ""); current.files[path] = { content: next, hash: hashContent(next) }; } } catch (error) { errors.push({ path, op: operation.op, error: error.message }); } }
+        current.messages.push({ role: "assistant", content: errors.length ? `Revision completed with ${errors.length} failed operation(s).` : "Revision applied successfully.", timestamp: new Date() }); current.status = "completed"; current.version += 1; current.markModified("files"); await current.save(); return res.json(projectResponse(current, { errors }));
+    } catch (error) { const failed = await Project.findById(project._id); if (failed) { failed.status = "failed"; failed.error = error.message || "Revision failed"; await failed.save().catch(() => {}); } return res.status(500).json({ error: error.message || "Revision failed" }); }
 }
 
-export async function publishProject(req, res) {
-    if (!req.user) return res.status(401).json({ error: "Unauthorized" });
-    const project = await Project.findOne({ _id: req.params.id, owner: req.user.userId });
-    if (!project) return res.status(404).json({ error: "Project not found" });
-    const verification = verifyProject(serializeFiles(project.files), project.verification?.runtime || {});
-    if (verification.status !== "verified") {
-        return res.status(409).json({ error: "Project must pass syntax, dependency, and runtime verification before publishing.", verification });
-    }
-    project.published = true;
-    await project.save();
-    return res.json({ success: true, published: project.published, verification });
-}
+export async function publishProject(req, res) { if (!req.user) return res.status(401).json({ error: "Unauthorized" }); const project = await Project.findOne({ _id: req.params.id, owner: req.user.userId }); if (!project) return res.status(404).json({ error: "Project not found" }); const verification = verifyProject(serializeFiles(project.files), project.verification?.runtime || {}, project.version); if (verification.status !== "verified") return res.status(409).json({ error: "Project must pass syntax, dependency, build, and runtime verification before publishing.", verification }); project.published = true; await project.save(); return res.json({ success: true, published: project.published, verification }); }
 export async function getPublicProject(req, res) { const project = await Project.findById(req.params.id); if (!project) return res.status(404).json({ error: "Project not found" }); if (!project.published) return res.status(403).json({ error: "Project is not published yet" }); return res.json({ _id: project._id, name: project.name, description: project.description, files: serializeFiles(project.files), fileHashes: serializeFileHashes(project.files), version: project.version }); }
