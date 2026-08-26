@@ -45,6 +45,7 @@ const ProjectSchema = new Schema({
     owner: { type: Schema.Types.ObjectId, ref: "User", required: true, index: true },
     published: { type: Boolean, default: false },
     status: { type: String, enum: ["pending", "generating", "revising", "completed", "failed"], default: "pending" },
+    generationStage: { type: String, enum: ["planning", "generating", "validating_integrity", "validating_build", "finalizing", "awaiting_runtime", "failed", "completed"], default: "planning" },
     filesPlanned: { type: [PlannedFileSchema], default: [] },
     filesGenerated: { type: [String], default: [] },
     currentFile: { type: String, default: null },
