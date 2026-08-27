@@ -9,6 +9,7 @@ import { selectRelevantFiles } from "./fileRelevance.js";
 import { buildDependencyGraph, getAffectedFiles, getDependencyReport } from "./dependencyGraph.js";
 import { analyzeProjectIntegrity, getCriticalIntegrityErrors } from "./projectIntegrity.js";
 import { validateProjectBuild } from "./projectBuildValidator.js";
+import { PROJECT_LIMITS, validateProjectFiles, assertPromptSize } from "./projectLimits.js";
 
 const MODEL = process.env.OPENROUTER_MODEL || "openrouter/free";
 const MAX_CONCURRENCY = Math.max(1, parseInt(process.env.AI_MAX_CONCURRENCY || "4", 10) || 4);
@@ -29,6 +30,7 @@ async function generateSingleFile(file, allFiles, prompt, alreadyGeneratedFiles,
         const { object } = await generateObject({ model, schema: FileCodeSchema, system, prompt: userMsg, maxRetries: 2 });
         let code = normalizeContent(object.code);
         if (!code.trim()) throw new Error("Generated code is empty after normalization");
+        if (Buffer.byteLength(code, "utf8") > PROJECT_LIMITS.maxFileBytes) throw new Error(`Generated file exceeds the ${PROJECT_LIMITS.maxFileBytes}-byte limit`);
         const validation = validateAndFixCode(code, file.path, { allPlannedFiles: allFiles });
         code = validation.code;
         const errors = inspectGeneratedCode(code, file.path, { allPlannedFiles: allFiles });
@@ -69,10 +71,13 @@ async function repairProjectBuild(files, plan, prompt, callbacks) {
 
 export async function generateProject(prompt, callbacks) {
     if (!process.env.OPENROUTER_API_KEY) throw new Error("OPENROUTER_API_KEY is not configured");
+    assertPromptSize(prompt);
     await emitStage(callbacks, "planning");
     const { object: plan } = await generateObject({ model, schema: FilePlanSchema, system: FILE_PLAN_SYSTEM, prompt: `Plan a React website for: ${prompt}`, maxRetries: 2 });
+    if (plan.files.length > PROJECT_LIMITS.maxFiles) throw Object.assign(new Error(`Generation plan exceeds the ${PROJECT_LIMITS.maxFiles}-file limit`), { status: 413, code: "PROJECT_FILE_COUNT_LIMIT" });
     if (!plan.files.find((file) => normalizePath(file.path) === "/App.js")) plan.files.unshift({ path: "/App.js", description: "Main application entry point", exports: "default App", imports: ["./styles.css"] });
     if (!plan.files.find((file) => normalizePath(file.path) === "/styles.css")) plan.files.push({ path: "/styles.css", description: "Global styles", exports: "none", imports: [] });
+    if (plan.files.length > PROJECT_LIMITS.maxFiles) throw Object.assign(new Error(`Generation plan exceeds the ${PROJECT_LIMITS.maxFiles}-file limit`), { status: 413, code: "PROJECT_FILE_COUNT_LIMIT" });
     if (callbacks?.onPlan) await callbacks.onPlan(plan);
     await emitStage(callbacks, "generating");
     const files = {}, priorities = [...new Set(plan.files.map(getGenerationPriority))].sort((a, b) => a - b);
@@ -85,11 +90,13 @@ export async function generateProject(prompt, callbacks) {
         for (const file of pendingFiles) { const path = normalizePath(file.path); files[path] = createFallback(file); if (callbacks?.onFileComplete) await callbacks.onFileComplete(path, files[path]); }
     }
     if (!files["/App.js"] && !files["/App.jsx"]) throw new Error("AI did not produce an application entry point");
+    validateProjectFiles(files);
     await emitStage(callbacks, "validating_integrity");
     const integrity = await repairProjectIntegrity(files, plan, prompt, callbacks);
     await emitStage(callbacks, "validating_build");
     const build = await repairProjectBuild(files, plan, prompt, callbacks);
     await emitStage(callbacks, "finalizing");
+    validateProjectFiles(files);
     const finalIntegrity = analyzeProjectIntegrity(files);
     if (callbacks?.onValidation) await callbacks.onValidation({ type: "project-integrity", report: finalIntegrity });
     if (callbacks?.onValidation) await callbacks.onValidation({ type: "project-build", report: build });
@@ -98,6 +105,8 @@ export async function generateProject(prompt, callbacks) {
 }
 
 export async function reviseProject(prompt, manifest, allFiles, recentMessages) {
+    assertPromptSize(prompt);
+    validateProjectFiles(allFiles);
     const graphResult = buildDependencyGraph(allFiles), selection = selectRelevantFiles(prompt, manifest, allFiles, { maxFiles: MAX_REVISION_FILES, maxCharacters: MAX_REVISION_CONTEXT }), selectedPaths = Object.keys(selection.files), affectedPaths = getAffectedFiles(graphResult, selectedPaths, { includeDependencies: true, includeDependents: true }), contextPaths = [...new Set([...selectedPaths, ...affectedPaths])].filter((path) => allFiles[path]).slice(0, MAX_REVISION_FILES), contextFiles = Object.fromEntries(contextPaths.map((path) => [path, allFiles[path]]));
     const contextParts = ["## Current Project Files (manifest)", "```", ...manifest.map((file) => `${file.path} (${file.hash}, ${file.size}B)`), "```", "\n## Relevant and Dependency-Affected Files", ...Object.entries(contextFiles).map(([path, content]) => `\n### ${path}\n\`\`\`javascript\n${content}\n\`\`\``), `\n## Dependency Report\n${JSON.stringify(getDependencyReport(graphResult))}`];
     if (recentMessages?.length) { contextParts.push("\n## Recent Conversation"); for (const message of recentMessages.slice(-3)) contextParts.push(`${message.role}: ${message.content}`); }
