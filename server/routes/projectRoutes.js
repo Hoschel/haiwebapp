@@ -4,18 +4,19 @@ import { getProjectVerification, reportRuntimeVerification } from "../controller
 import { authMiddleware } from "../middleware/authMiddleware.js";
 import { chat } from "../controllers/chatController.js";
 import { rateLimit } from "../middleware/rateLimitMiddleware.js";
+import { validateFilesRequest, validatePatchRequest, validatePromptRequest } from "../middleware/projectLimitsMiddleware.js";
 
 const projectRouter = Router();
 projectRouter.get("/public/:id", getPublicProject);
 projectRouter.use(authMiddleware);
-projectRouter.post("/", createProject);
+projectRouter.post("/", validatePromptRequest, createProject);
 projectRouter.get("/", listProjects);
 projectRouter.get("/:id/verification", getProjectVerification);
 projectRouter.post("/:id/verification/runtime", reportRuntimeVerification);
 projectRouter.get("/:id", getProject);
 projectRouter.delete("/:id", deleteProject);
-projectRouter.put("/:id/files", updateProjectFiles);
-projectRouter.patch("/:id/files", patchProjectFiles);
+projectRouter.put("/:id/files", validateFilesRequest, updateProjectFiles);
+projectRouter.patch("/:id/files", validatePatchRequest, patchProjectFiles);
 projectRouter.post("/:id/publish", publishProject);
-projectRouter.post("/:id/chat", rateLimit({ windowMs: 60_000, max: 12, keyGenerator: (req) => req.user?.userId || req.ip || "anonymous", message: "Too many AI requests. Please wait before sending another prompt." }), chat);
+projectRouter.post("/:id/chat", rateLimit({ windowMs: 60_000, max: 12, keyGenerator: (req) => req.user?.userId || req.ip || "anonymous", message: "Too many AI requests. Please wait before sending another prompt." }), validatePromptRequest, chat);
 export default projectRouter;
