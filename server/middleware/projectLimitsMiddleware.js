@@ -17,6 +17,10 @@ export function validateFilesRequest(req, res, next) {
     try {
         const { files } = req.body || {};
         if (!files || typeof files !== "object" || Array.isArray(files)) return res.status(400).json({ error: "files object is required" });
+        for (const [path, content] of Object.entries(files)) {
+            if (!String(path).startsWith("/")) return res.status(400).json({ error: `Invalid file path: ${path}` });
+            if (typeof content !== "string") return res.status(400).json({ error: `File content must be a string: ${path}` });
+        }
         validateProjectFiles(files);
         next();
     } catch (error) {
@@ -35,6 +39,7 @@ export async function validatePatchRequest(req, res, next) {
         for (const patch of patches) {
             if (!patch || typeof patch.path !== "string" || !["upsert", "delete"].includes(patch.op)) return res.status(400).json({ error: "Each patch needs path and op=upsert|delete" });
             const path = normalizePath(patch.path);
+            if (!path.startsWith("/") || path === "/") return res.status(400).json({ error: `Invalid file path: ${patch.path}` });
             if (patch.op === "delete") delete files[path];
             else {
                 if (typeof patch.content !== "string") return res.status(400).json({ error: `content is required for ${path}` });
