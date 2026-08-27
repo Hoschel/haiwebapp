@@ -3,6 +3,7 @@ import { createProject, deleteProject, getProject, getPublicProject, listProject
 import { getProjectVerification, reportRuntimeVerification } from "../controllers/verificationController.js";
 import { authMiddleware } from "../middleware/authMiddleware.js";
 import { chat } from "../controllers/chatController.js";
+import { rateLimit } from "../middleware/rateLimitMiddleware.js";
 
 const projectRouter = Router();
 projectRouter.get("/public/:id", getPublicProject);
@@ -16,5 +17,5 @@ projectRouter.delete("/:id", deleteProject);
 projectRouter.put("/:id/files", updateProjectFiles);
 projectRouter.patch("/:id/files", patchProjectFiles);
 projectRouter.post("/:id/publish", publishProject);
-projectRouter.post("/:id/chat", chat);
+projectRouter.post("/:id/chat", rateLimit({ windowMs: 60_000, max: 12, keyGenerator: (req) => req.user?.userId || req.ip || "anonymous", message: "Too many AI requests. Please wait before sending another prompt." }), chat);
 export default projectRouter;
