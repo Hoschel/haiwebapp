@@ -9,10 +9,13 @@ export const AI_OPERATION_LIMITS = Object.freeze({
     maxProviderCalls: intEnv("AI_MAX_PROVIDER_CALLS", 180, 1, 500),
 });
 
+const asUsageNumber = (value) => Number.isFinite(Number(value)) ? Math.max(0, Number(value)) : 0;
+
 export function createOperationBudget({ timeoutMs, maxCalls = AI_OPERATION_LIMITS.maxProviderCalls, label = "AI operation" } = {}) {
     const startedAt = Date.now();
     const deadline = startedAt + timeoutMs;
     let calls = 0;
+    const usage = { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
     const assertActive = () => {
         if (Date.now() > deadline) throw Object.assign(new Error(`${label} exceeded its time budget`), { status: 504, code: "AI_OPERATION_TIMEOUT" });
     };
@@ -24,7 +27,15 @@ export function createOperationBudget({ timeoutMs, maxCalls = AI_OPERATION_LIMIT
             if (calls > maxCalls) throw Object.assign(new Error(`${label} exceeded its provider-call budget`), { status: 429, code: "AI_OPERATION_CALL_BUDGET_EXCEEDED" });
             return calls;
         },
-        snapshot() { return { startedAt, deadline, calls, maxCalls, timeoutMs }; },
+        recordUsage(rawUsage) {
+            const inputTokens = asUsageNumber(rawUsage?.inputTokens ?? rawUsage?.promptTokens);
+            const outputTokens = asUsageNumber(rawUsage?.outputTokens ?? rawUsage?.completionTokens);
+            const reportedTotal = asUsageNumber(rawUsage?.totalTokens);
+            usage.inputTokens += inputTokens;
+            usage.outputTokens += outputTokens;
+            usage.totalTokens += reportedTotal || inputTokens + outputTokens;
+        },
+        snapshot() { return { startedAt, deadline, calls, maxCalls, timeoutMs, usage: { ...usage } }; },
     };
 }
 
@@ -32,8 +43,15 @@ export function createBudgetedProviderCall(generate, budget) {
     if (typeof generate !== "function") throw new TypeError("generate must be a function");
     if (!budget?.consumeCall) throw new TypeError("A valid operation budget is required");
     return async (options) => {
-        budget.consumeCall();
-        return generate({ ...options, maxRetries: 0 });
+        try {
+            budget.consumeCall();
+            const result = await generate({ ...options, maxRetries: 0 });
+            budget.recordUsage?.(result?.usage);
+            return result;
+        } catch (error) {
+            error.operationBudget = budget.snapshot?.();
+            throw error;
+        }
     };
 }
 
