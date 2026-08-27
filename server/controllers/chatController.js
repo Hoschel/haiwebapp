@@ -4,6 +4,8 @@ import { reviseProject } from "../services/ai.js";
 import { verifyProject } from "../services/projectVerification.js";
 import { createBuildRepairPrompt } from "../services/buildRepair.js";
 
+const MAX_PROMPT_LENGTH = 12_000;
+
 function hashContent(content) { return crypto.createHash("sha256").update(content).digest("hex").slice(0, 16); }
 function entriesOf(files) { return !files ? [] : files instanceof Map ? [...files.entries()] : Object.entries(files); }
 function buildManifest(files) { return entriesOf(files).map(([path, entry]) => { const content = typeof entry === "string" ? entry : entry?.content || ""; return { path, hash: entry?.hash || hashContent(content), size: content.length }; }); }
@@ -47,6 +49,7 @@ async function requestRevision(prompt, files, messages) {
 export async function chat(req, res) {
     const { prompt } = req.body;
     if (!prompt || typeof prompt !== "string" || !prompt.trim()) return res.status(400).json({ error: "prompt is required" });
+    if (prompt.length > MAX_PROMPT_LENGTH) return res.status(413).json({ error: `Prompt is too long. Maximum length is ${MAX_PROMPT_LENGTH} characters.` });
     if (!req.user) return res.status(401).json({ error: "Unauthorized" });
     const project = await Project.findOne({ _id: req.params.id, owner: req.user.userId });
     if (!project) return res.status(404).json({ error: "Project not found" });
@@ -71,11 +74,7 @@ export async function chat(req, res) {
             const repairPrompt = createBuildRepairPrompt(verification, 1);
             const repairResult = await requestRevision(repairPrompt, appliedResult.files, [...current.messages, { role: "user", content: repairPrompt }]);
             const repaired = applyOperations(appliedResult.files, repairResult.operations);
-            appliedResult = {
-                files: repaired.files,
-                applied: [...appliedResult.applied, ...repaired.applied],
-                errors: [...appliedResult.errors, ...repaired.errors],
-            };
+            appliedResult = { files: repaired.files, applied: [...appliedResult.applied, ...repaired.applied], errors: [...appliedResult.errors, ...repaired.errors] };
             verification = verifyProject(serializeFiles(appliedResult.files));
             result = { ...repairResult, description: verification.status === "failed" ? `${result.description || "Revision applied."} Automatic build repair could not fully resolve validation errors.` : `${result.description || "Revision applied."} Automatic build repair succeeded.` };
         }
