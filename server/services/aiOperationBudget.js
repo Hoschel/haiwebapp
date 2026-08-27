@@ -14,21 +14,26 @@ export function createOperationBudget({ timeoutMs, maxCalls = AI_OPERATION_LIMIT
     const deadline = startedAt + timeoutMs;
     let calls = 0;
     const assertActive = () => {
-        if (Date.now() > deadline) {
-            throw Object.assign(new Error(`${label} exceeded its time budget`), { status: 504, code: "AI_OPERATION_TIMEOUT" });
-        }
+        if (Date.now() > deadline) throw Object.assign(new Error(`${label} exceeded its time budget`), { status: 504, code: "AI_OPERATION_TIMEOUT" });
     };
     return {
         assertActive,
         consumeCall() {
             assertActive();
             calls += 1;
-            if (calls > maxCalls) {
-                throw Object.assign(new Error(`${label} exceeded its provider-call budget`), { status: 429, code: "AI_OPERATION_CALL_BUDGET_EXCEEDED" });
-            }
+            if (calls > maxCalls) throw Object.assign(new Error(`${label} exceeded its provider-call budget`), { status: 429, code: "AI_OPERATION_CALL_BUDGET_EXCEEDED" });
             return calls;
         },
         snapshot() { return { startedAt, deadline, calls, maxCalls, timeoutMs }; },
+    };
+}
+
+export function createBudgetedProviderCall(generate, budget) {
+    if (typeof generate !== "function") throw new TypeError("generate must be a function");
+    if (!budget?.consumeCall) throw new TypeError("A valid operation budget is required");
+    return async (options) => {
+        budget.consumeCall();
+        return generate({ ...options, maxRetries: 0 });
     };
 }
 
