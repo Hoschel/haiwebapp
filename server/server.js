@@ -5,6 +5,7 @@ import cookieParser from "cookie-parser";
 import { connectToDatabase } from "./config/db.js";
 import authRouter from "./routes/authRoutes.js";
 import projectRouter from "./routes/projectRoutes.js";
+import { rateLimit } from "./middleware/rateLimitMiddleware.js";
 
 const app = express();
 const origins = (process.env.ORIGINS || "http://localhost:5173")
@@ -14,20 +15,22 @@ const origins = (process.env.ORIGINS || "http://localhost:5173")
 
 await connectToDatabase();
 
+app.disable("x-powered-by");
 app.use(cors({ origin: origins, credentials: true }));
 app.use(cookieParser());
-app.use(express.json({ limit: "2mb" }));
+app.use(express.json({ limit: "2mb", strict: true }));
+app.use("/api/auth", rateLimit({ windowMs: 60_000, max: 30, keyGenerator: (req) => req.ip || "anonymous", message: "Too many authentication requests. Please try again later." }), authRouter);
+app.use("/api/projects", rateLimit({ windowMs: 60_000, max: 120 }), projectRouter);
 
 app.get("/", (_req, res) => res.send("Server is Live!"));
-app.use("/api/auth", authRouter);
-app.use("/api/projects", projectRouter);
 
 app.use((err, _req, res, _next) => {
     console.error("[Error]", err);
+    const status = Number.isInteger(err.status) && err.status >= 400 && err.status < 600 ? err.status : 500;
     const message = process.env.NODE_ENV === "production"
-        ? "Internal server error"
+        ? (status === 429 ? err.message : "Internal server error")
         : err.message || "Internal server error";
-    res.status(err.status || 500).json({ error: message });
+    res.status(status).json({ error: message });
 });
 
 const port = Number(process.env.PORT) || 3000;
