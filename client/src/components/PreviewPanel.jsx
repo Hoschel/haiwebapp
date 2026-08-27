@@ -15,6 +15,9 @@ function SandpackFileWatches({ onLiveFilesChange }) {
 
     useEffect(() => {
         projectRef.current = activeProject;
+    }, [activeProject]);
+
+    useEffect(() => {
         initializedRef.current = false;
         lastSentRef.current = "";
     }, [activeProject?._id, activeProject?.version]);
