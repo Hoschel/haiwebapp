@@ -1,4 +1,5 @@
 import { AIOperation } from "../models/AIOperation.js";
+import { Project } from "../models/Project.js";
 
 const intEnv = (name, fallback, min, max) => {
     const value = Number.parseInt(process.env[name] || "", 10);
@@ -11,8 +12,15 @@ export const AI_OPERATION_RECOVERY = Object.freeze({
 
 export async function recoverStaleAIOperations({ now = new Date() } = {}) {
     const cutoff = new Date(now.getTime() - AI_OPERATION_RECOVERY.staleAfterMs);
-    const result = await AIOperation.updateMany(
+    const staleOperations = await AIOperation.find(
         { status: "running", startedAt: { $lt: cutoff } },
+        { operationId: 1, project: 1 },
+    ).lean();
+    if (!staleOperations.length) return { recovered: 0, cutoff };
+
+    const operationIds = staleOperations.map((operation) => operation.operationId);
+    const result = await AIOperation.updateMany(
+        { operationId: { $in: operationIds }, status: "running" },
         {
             $set: {
                 status: "failed",
@@ -21,5 +29,19 @@ export async function recoverStaleAIOperations({ now = new Date() } = {}) {
             },
         },
     );
+
+    await Project.updateMany(
+        { generationOperationId: { $in: operationIds }, status: { $in: ["pending", "generating", "revising"] } },
+        {
+            $set: {
+                status: "failed",
+                generationStage: "failed",
+                generationOperationId: null,
+                currentFile: null,
+                error: "AI operation was interrupted and recovered after a server restart",
+            },
+        },
+    );
+
     return { recovered: result.modifiedCount ?? result.nModified ?? 0, cutoff };
 }
