@@ -6,6 +6,7 @@ import { connectToDatabase } from "./config/db.js";
 import authRouter from "./routes/authRoutes.js";
 import projectRouter from "./routes/projectRoutes.js";
 import { rateLimit } from "./middleware/rateLimitMiddleware.js";
+import { recoverStaleAIOperations } from "./services/aiOperationRecovery.js";
 
 const app = express();
 const origins = (process.env.ORIGINS || "http://localhost:5173")
@@ -14,6 +15,7 @@ const origins = (process.env.ORIGINS || "http://localhost:5173")
     .filter(Boolean);
 
 await connectToDatabase();
+await recoverStaleAIOperations();
 
 app.disable("x-powered-by");
 app.use(cors({ origin: origins, credentials: true }));
