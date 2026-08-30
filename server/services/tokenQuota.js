@@ -8,7 +8,6 @@ const intEnv = (name, fallback, min, max) => {
 export const TOKEN_QUOTA = Object.freeze({
     dailyFreeTokens: intEnv("DAILY_FREE_TOKENS", 1_000_000, 1, 100_000_000),
     reservationChunk: intEnv("AI_TOKEN_RESERVATION_CHUNK", 200_000, 10_000, 1_000_000),
-    topUpThreshold: intEnv("AI_TOKEN_RESERVATION_TOPUP_THRESHOLD", 100_000, 1_000, 500_000),
     resetWindowMs: intEnv("FREE_TOKEN_RESET_WINDOW_MS", 24 * 60 * 60 * 1000, 60_000, 7 * 24 * 60 * 60 * 1000),
 });
 
@@ -24,7 +23,6 @@ async function ensureAccount(owner) {
         { $setOnInsert: { owner, dailyFreeLimit: TOKEN_QUOTA.dailyFreeTokens, freeRemaining: TOKEN_QUOTA.dailyFreeTokens, freeResetAt: new Date(now.getTime() + TOKEN_QUOTA.resetWindowMs) } },
         { upsert: true, new: true, setDefaultsOnInsert: true },
     );
-
     if (account.freeResetAt <= now) {
         account = await TokenAccount.findOneAndUpdate(
             { owner, freeResetAt: { $lte: now } },
@@ -36,111 +34,75 @@ async function ensureAccount(owner) {
 }
 
 function quotaSnapshot(account) {
-    const available = Math.max(0, account.freeRemaining + account.paidBalance - account.reservedTokens);
     return {
         dailyFreeLimit: account.dailyFreeLimit,
         freeRemaining: account.freeRemaining,
         paidBalance: account.paidBalance,
         reservedTokens: account.reservedTokens,
-        available,
+        available: Math.max(0, account.freeRemaining + account.paidBalance - account.reservedTokens),
         freeResetAt: account.freeResetAt,
     };
 }
 
-export async function getTokenQuota(owner) {
-    return quotaSnapshot(await ensureAccount(owner));
+function quotaError(snapshot, message = "Daily token limit reached. Wait until the free token reset time or purchase additional tokens to continue.") {
+    const error = new Error(message);
+    error.status = 402;
+    error.code = "AI_TOKEN_QUOTA_EXCEEDED";
+    error.quota = snapshot;
+    return error;
 }
 
-export async function reserveTokens(owner, operationId, amount = TOKEN_QUOTA.reservationChunk) {
+export async function getTokenQuota(owner) { return quotaSnapshot(await ensureAccount(owner)); }
+
+export async function reserveTokens(owner, operationId, reservationId, amount = TOKEN_QUOTA.reservationChunk) {
     const requested = asTokens(amount);
-    if (!requested || !operationId) throw new Error("Token reservation requires an operationId and a positive amount");
+    if (!requested || !operationId || !reservationId) throw new Error("Token reservation requires operationId, reservationId and a positive amount");
     await ensureAccount(owner);
-
     const availableExpression = { $subtract: [{ $add: ["$freeRemaining", "$paidBalance"] }, "$reservedTokens"] };
     const account = await TokenAccount.findOneAndUpdate(
-        {
-            owner,
-            "activeReservations.operationId": { $ne: operationId },
-            $expr: { $gte: [availableExpression, requested] },
-        },
-        {
-            $inc: { reservedTokens: requested },
-            $push: { activeReservations: { operationId, reservedTokens: requested, createdAt: new Date() } },
-        },
-        { new: true },
-    );
-
-    if (!account) {
-        const current = await ensureAccount(owner);
-        const snapshot = quotaSnapshot(current);
-        const error = new Error(snapshot.freeRemaining === 0 && snapshot.paidBalance === 0 && snapshot.reservedTokens === 0
-            ? "Daily token limit reached. Wait until the free token reset time or purchase additional tokens to continue."
-            : "Not enough available tokens for this AI operation.");
-        error.status = 402;
-        error.code = "AI_TOKEN_QUOTA_EXCEEDED";
-        error.quota = snapshot;
-        throw error;
-    }
-    return quotaSnapshot(account);
-}
-
-export async function topUpReservation(owner, operationId, amount = TOKEN_QUOTA.reservationChunk) {
-    const requested = asTokens(amount);
-    if (!requested) return getTokenQuota(owner);
-    const availableExpression = { $subtract: [{ $add: ["$freeRemaining", "$paidBalance"] }, "$reservedTokens"] };
-    const account = await TokenAccount.findOneAndUpdate(
-        { owner, "activeReservations.operationId": operationId, $expr: { $gte: [availableExpression, requested] } },
-        [
-            { $set: {
-                reservedTokens: { $add: ["$reservedTokens", requested] },
-                activeReservations: { $map: { input: "$activeReservations", as: "reservation", in: { $cond: [{ $eq: ["$$reservation.operationId", operationId] }, { $mergeObjects: ["$$reservation", { reservedTokens: { $add: ["$$reservation.reservedTokens", requested] } }] }, "$$reservation"] } } },
-            } },
-        ],
+        { owner, "activeReservations.reservationId": { $ne: reservationId }, $expr: { $gte: [availableExpression, requested] } },
+        { $inc: { reservedTokens: requested }, $push: { activeReservations: { operationId, reservationId, reservedTokens: requested, createdAt: new Date() } } },
         { new: true },
     );
     if (!account) {
         const current = await ensureAccount(owner);
-        const error = new Error("Token quota is exhausted. Wait for the free reset or purchase additional tokens.");
-        error.status = 402;
-        error.code = "AI_TOKEN_QUOTA_EXCEEDED";
-        error.quota = quotaSnapshot(current);
-        throw error;
+        const existing = current.activeReservations?.find((item) => item.reservationId === reservationId);
+        if (existing) return quotaSnapshot(current);
+        throw quotaError(quotaSnapshot(current));
     }
     return quotaSnapshot(account);
 }
 
-export async function consumeReservedTokens(owner, operationId, amount) {
+export async function consumeReservedTokens(owner, operationId, reservationId, amount) {
     const requested = asTokens(amount);
     if (!requested) return getTokenQuota(owner);
     const account = await TokenAccount.findOneAndUpdate(
-        { owner, "activeReservations.operationId": operationId, "activeReservations.reservedTokens": { $gte: requested } },
+        { owner, activeReservations: { $elemMatch: { operationId, reservationId, reservedTokens: { $gte: requested } } } },
         [
             { $set: {
                 freeRemaining: { $subtract: ["$freeRemaining", { $min: [requested, "$freeRemaining"] }] },
                 paidBalance: { $subtract: ["$paidBalance", { $max: [0, { $subtract: [requested, "$freeRemaining"] }] }] },
                 reservedTokens: { $subtract: ["$reservedTokens", requested] },
-                activeReservations: { $map: { input: "$activeReservations", as: "reservation", in: { $cond: [{ $eq: ["$$reservation.operationId", operationId] }, { $mergeObjects: ["$$reservation", { reservedTokens: { $subtract: ["$$reservation.reservedTokens", requested] } }] }, "$$reservation"] } } },
+                activeReservations: { $map: { input: "$activeReservations", as: "reservation", in: { $cond: [{ $eq: ["$$reservation.reservationId", reservationId] }, { $mergeObjects: ["$$reservation", { reservedTokens: { $subtract: ["$$reservation.reservedTokens", requested] } }] }, "$$reservation"] } } },
             } },
             { $set: { activeReservations: { $filter: { input: "$activeReservations", as: "reservation", cond: { $gt: ["$$reservation.reservedTokens", 0] } } } } },
         ],
         { new: true },
     );
     if (!account) {
-        const error = new Error("AI token reservation was exhausted before provider usage could be charged");
-        error.status = 402;
-        error.code = "AI_TOKEN_RESERVATION_EXCEEDED";
-        throw error;
+        const current = await ensureAccount(owner);
+        throw quotaError(quotaSnapshot(current), "The provider usage exceeded the token reservation for this AI call.");
     }
     return quotaSnapshot(account);
 }
 
-export async function releaseReservedTokens(owner, operationId) {
+export async function releaseReservedTokens(owner, operationId, reservationId) {
     const account = await TokenAccount.findOneAndUpdate(
-        { owner, "activeReservations.operationId": operationId },
+        { owner, activeReservations: { $elemMatch: { operationId, reservationId } } },
         [
             { $set: {
-                reservedTokens: { $subtract: ["$reservedTokens", { $let: { vars: { reservation: { $arrayElemAt: [{ $filter: { input: "$activeReservations", as: "item", cond: { $eq: ["$$item.operationId", operationId] } } }, 0] } }, in: "$$reservation.reservedTokens" } }] },
-                activeReservations: { $filter: { input: "$activeReservations", as: "reservation", cond: { $ne: ["$$reservation.operationId", operationId] } } },
+                reservedTokens: { $subtract: ["$reservedTokens", { $let: { vars: { reservation: { $arrayElemAt: [{ $filter: { input: "$activeReservations", as: "item", cond: { $and: [{ $eq: ["$$item.operationId", operationId] }, { $eq: ["$$item.reservationId", reservationId] }] } } }, 0] } }, in: "$$reservation.reservedTokens" } }] },
+                activeReservations: { $filter: { input: "$activeReservations", as: "reservation", cond: { $not: { $and: [{ $eq: ["$$reservation.operationId", operationId] }, { $eq: ["$$reservation.reservationId", reservationId] }] } } } },
             } },
         ],
         { new: true },
