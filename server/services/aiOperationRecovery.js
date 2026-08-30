@@ -31,7 +31,10 @@ export async function recoverStaleAIOperations({ now = new Date() } = {}) {
     );
 
     await Project.updateMany(
-        { generationOperationId: { $in: operationIds }, status: { $in: ["pending", "generating", "revising"] } },
+        {
+            generationOperationId: { $in: operationIds },
+            status: { $in: ["pending", "generating", "revising"] },
+        },
         {
             $set: {
                 status: "failed",
