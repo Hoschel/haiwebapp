@@ -52,7 +52,7 @@ async function repairProjectIntegrity(files, plan, prompt, callbacks, ask) {
         const critical = getCriticalIntegrityErrors(report); if (!critical.length) break;
         const affected = new Set(); for (const item of report.syntaxErrors) affected.add(item.path); for (const item of report.unresolvedImports) affected.add(item.from);
         const repairFiles = plan.files.filter((file) => affected.has(normalizePath(file.path))).slice(0, 6); if (!repairFiles.length) break;
-        await pMap(repairFiles, async (file) => { try { if (callbacks?.onFileStart) await callbacks.onFileStart(file.path); const errorsForFile = critical.filter((error) => error.startsWith(`${normalizePath(file.path)}:`)); const repair = `FINAL PROJECT INTEGRITY REPAIR. The project currently has these issues:\n- ${errorsForFile.join("\n- ")}\nRegenerate this COMPLETE file so its imports and syntax are compatible with the existing project files.`; const result = await generateSingleFile(file, plan.files, prompt, { ...files }, ask, repair); files[normalizePath(result.path)] = result.code; if (callbacks?.onFileComplete) await callbacks.onFileComplete(result.path, result.code); } catch (error) { if (error?.code === "AI_OPERATION_CALL_BUDGET_EXCEEDED" || error?.code === "AI_OPERATION_TIMEOUT") throw error; console.warn(`[AI] Integrity repair failed for ${file.path}: ${error.message}`); } }, { concurrency: Math.min(MAX_CONCURRENCY, 3) });
+        await pMap(repairFiles, async (file) => { try { if (callbacks?.onFileStart) await callbacks.onFileStart(file.path); const errorsForFile = critical.filter((error) => error.startsWith(`${normalizePath(file.path)}:`)); const repair = `FINAL PROJECT INTEGRITY REPAIR. The project currently has these issues:\n- ${errorsForFile.join("\n- ")}\nRegenerate this COMPLETE file so its imports and syntax are compatible with the existing project files.`; const result = await generateSingleFile(file, plan.files, prompt, { ...files }, ask, repair); files[normalizePath(result.path)] = result.code; if (callbacks?.onFileComplete) await callbacks.onFileComplete(result.path, result.code); } catch (error) { if (error?.code === "AI_OPERATION_CALL_BUDGET_EXCEEDED" || error?.code === "AI_OPERATION_TIMEOUT" || error?.code === "AI_TOKEN_QUOTA_EXCEEDED" || error?.code === "AI_TOKEN_RESERVATION_EXCEEDED") throw error; console.warn(`[AI] Integrity repair failed for ${file.path}: ${error.message}`); } }, { concurrency: Math.min(MAX_CONCURRENCY, 3) });
         report = analyzeProjectIntegrity(files);
     }
     return report;
@@ -66,7 +66,7 @@ async function repairProjectBuild(files, plan, prompt, callbacks, ask) {
         if (!repairFiles.length) repairFiles = plan.files.filter((file) => ["/App.js", "/App.jsx", "/main.js", "/main.jsx", "/index.js", "/index.jsx"].includes(normalizePath(file.path))).slice(0, 1);
         repairFiles = repairFiles.slice(0, 6); if (!repairFiles.length) break;
         const details = (report.errors || []).slice(0, 20).map((item) => `${item.path || "project"}: ${item.error || "Build validation failed"}`).join("\n- ");
-        await pMap(repairFiles, async (file) => { try { if (callbacks?.onFileStart) await callbacks.onFileStart(file.path); const repair = `FINAL PROJECT BUILD REPAIR. Build validation failed with:\n- ${details}\nRegenerate this COMPLETE file. Fix the root cause only, preserve the intended UI and existing project architecture, and do not use placeholders or merge markers.`; const result = await generateSingleFile(file, plan.files, prompt, { ...files }, ask, repair); files[normalizePath(result.path)] = result.code; if (callbacks?.onFileComplete) await callbacks.onFileComplete(result.path, result.code); } catch (error) { if (error?.code === "AI_OPERATION_CALL_BUDGET_EXCEEDED" || error?.code === "AI_OPERATION_TIMEOUT") throw error; console.warn(`[AI] Build repair failed for ${file.path}: ${error.message}`); } }, { concurrency: Math.min(MAX_CONCURRENCY, 2) });
+        await pMap(repairFiles, async (file) => { try { if (callbacks?.onFileStart) await callbacks.onFileStart(file.path); const repair = `FINAL PROJECT BUILD REPAIR. Build validation failed with:\n- ${details}\nRegenerate this COMPLETE file. Fix the root cause only, preserve the intended UI and existing project architecture, and do not use placeholders or merge markers.`; const result = await generateSingleFile(file, plan.files, prompt, { ...files }, ask, repair); files[normalizePath(result.path)] = result.code; if (callbacks?.onFileComplete) await callbacks.onFileComplete(result.path, result.code); } catch (error) { if (error?.code === "AI_OPERATION_CALL_BUDGET_EXCEEDED" || error?.code === "AI_OPERATION_TIMEOUT" || error?.code === "AI_TOKEN_QUOTA_EXCEEDED" || error?.code === "AI_TOKEN_RESERVATION_EXCEEDED") throw error; console.warn(`[AI] Build repair failed for ${file.path}: ${error.message}`); } }, { concurrency: Math.min(MAX_CONCURRENCY, 2) });
         report = validateProjectBuild(files);
     }
     return report;
@@ -75,7 +75,7 @@ async function repairProjectBuild(files, plan, prompt, callbacks, ask) {
 export async function generateProject(prompt, callbacks) {
     if (!process.env.OPENROUTER_API_KEY) throw new Error("OPENROUTER_API_KEY is not configured");
     assertPromptSize(prompt);
-    const budget = createOperationBudget({ timeoutMs: AI_OPERATION_LIMITS.generationTimeoutMs, label: "Project generation" });
+    const budget = createOperationBudget({ timeoutMs: AI_OPERATION_LIMITS.generationTimeoutMs, label: "Project generation", userId: callbacks?.userId, operationId: callbacks?.operationId });
     const ask = createBudgetedProviderCall(generateObject, budget);
     await emitStage(callbacks, "planning");
     const { object: plan } = await ask({ model, schema: FilePlanSchema, system: FILE_PLAN_SYSTEM, prompt: `Plan a React website for: ${prompt}` });
@@ -91,7 +91,7 @@ export async function generateProject(prompt, callbacks) {
         let pendingFiles = plan.files.filter((file) => getGenerationPriority(file) === priority);
         for (let round = 0; round <= 2 && pendingFiles.length; round += 1) {
             budget.assertActive();
-            const results = await pMap(pendingFiles, async (file) => { try { if (callbacks?.onFileStart) await callbacks.onFileStart(file.path); const result = await generateSingleFile(file, plan.files, prompt, { ...files }, ask); if (callbacks?.onFileComplete) await callbacks.onFileComplete(file.path, result.code); return { success: true, file, result }; } catch (error) { if (error?.code === "AI_OPERATION_CALL_BUDGET_EXCEEDED" || error?.code === "AI_OPERATION_TIMEOUT") throw error; return { success: false, file, error }; } }, { concurrency: MAX_CONCURRENCY });
+            const results = await pMap(pendingFiles, async (file) => { try { if (callbacks?.onFileStart) await callbacks.onFileStart(file.path); const result = await generateSingleFile(file, plan.files, prompt, { ...files }, ask); if (callbacks?.onFileComplete) await callbacks.onFileComplete(file.path, result.code); return { success: true, file, result }; } catch (error) { if (["AI_OPERATION_CALL_BUDGET_EXCEEDED", "AI_OPERATION_TIMEOUT", "AI_TOKEN_QUOTA_EXCEEDED", "AI_TOKEN_RESERVATION_EXCEEDED"].includes(error?.code)) throw error; return { success: false, file, error }; } }, { concurrency: MAX_CONCURRENCY });
             pendingFiles = []; for (const entry of results) { if (entry.success) files[normalizePath(entry.result.path)] = entry.result.code; else pendingFiles.push(entry.file); }
         }
         for (const file of pendingFiles) { const path = normalizePath(file.path); files[path] = createFallback(file); if (callbacks?.onFileComplete) await callbacks.onFileComplete(path, files[path]); }
@@ -111,10 +111,10 @@ export async function generateProject(prompt, callbacks) {
     return { files, description: plan.projectDescription, dependencyReport: finalIntegrity.dependency, buildReport: build, operationBudget: budget.snapshot() };
 }
 
-export async function reviseProject(prompt, manifest, allFiles, recentMessages) {
+export async function reviseProject(prompt, manifest, allFiles, recentMessages, options = {}) {
     assertPromptSize(prompt);
     validateProjectFiles(allFiles);
-    const budget = createOperationBudget({ timeoutMs: AI_OPERATION_LIMITS.revisionTimeoutMs, label: "Project revision" });
+    const budget = createOperationBudget({ timeoutMs: AI_OPERATION_LIMITS.revisionTimeoutMs, label: "Project revision", userId: options.userId, operationId: options.operationId });
     const ask = createBudgetedProviderCall(generateObject, budget);
     const graphResult = buildDependencyGraph(allFiles), selection = selectRelevantFiles(prompt, manifest, allFiles, { maxFiles: MAX_REVISION_FILES, maxCharacters: MAX_REVISION_CONTEXT }), selectedPaths = Object.keys(selection.files), affectedPaths = getAffectedFiles(graphResult, selectedPaths, { includeDependencies: true, includeDependents: true }), contextPaths = [...new Set([...selectedPaths, ...affectedPaths])].filter((path) => allFiles[path]).slice(0, MAX_REVISION_FILES), contextFiles = Object.fromEntries(contextPaths.map((path) => [path, allFiles[path]]));
     const contextParts = ["## Current Project Files (manifest)", "```", ...manifest.map((file) => `${file.path} (${file.hash}, ${file.size}B)`), "```", "\n## Relevant and Dependency-Affected Files", ...Object.entries(contextFiles).map(([path, content]) => `\n### ${path}\n\`\`\`javascript\n${content}\n\`\`\``), `\n## Dependency Report\n${JSON.stringify(getDependencyReport(graphResult))}`];
