@@ -3,6 +3,7 @@ import { createProject, deleteProject, getProject, getPublicProject, listProject
 import { getProjectVerification, reportRuntimeVerification } from "../controllers/verificationController.js";
 import { authMiddleware } from "../middleware/authMiddleware.js";
 import { chat } from "../controllers/chatController.js";
+import { getMyTokenQuota } from "../controllers/tokenController.js";
 import { rateLimit } from "../middleware/rateLimitMiddleware.js";
 import { validateFilesRequest, validatePatchRequest, validatePromptRequest } from "../middleware/projectLimitsMiddleware.js";
 import { requireAITokens } from "../middleware/tokenQuotaMiddleware.js";
@@ -10,6 +11,7 @@ import { requireAITokens } from "../middleware/tokenQuotaMiddleware.js";
 const projectRouter = Router();
 projectRouter.get("/public/:id", getPublicProject);
 projectRouter.use(authMiddleware);
+projectRouter.get("/tokens", getMyTokenQuota);
 projectRouter.post("/", requireAITokens, validatePromptRequest, createProject);
 projectRouter.get("/", listProjects);
 projectRouter.get("/:id/verification", getProjectVerification);
