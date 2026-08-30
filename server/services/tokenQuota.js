@@ -48,7 +48,7 @@ export async function reserveTokens(owner, operationId, reservationId, amount = 
             paidBalance: { $subtract: ["$paidBalance", paidTake] },
             reservedTokens: { $add: ["$reservedTokens", requested] },
             freeResetAt: { $cond: [{ $and: [{ $gt: ["$freeRemaining", 0] }, { $eq: [nextFree, 0] }] }, new Date(now.getTime() + TOKEN_QUOTA.resetWindowMs), "$freeResetAt"] },
-            activeReservations: { $concatArrays: ["$activeReservations", [{ operationId, reservationId, reservedTokens: requested, freeReservedTokens: freeTake, paidReservedTokens: paidTake, freeCycleResetAt: "$freeResetAt", createdAt: now }]] },
+            activeReservations: { $concatArrays: ["$activeReservations", [{ operationId, reservationId, reservedTokens: requested, freeReservedTokens: freeTake, paidReservedTokens: paidTake, freeCycleResetAt: "$freeResetAt", consumptionApplied: false, createdAt: now }]] },
         } }], { new: true },
     );
     if (!account) { const current = await ensureAccount(owner); const existing = current.activeReservations?.find((item) => item.reservationId === reservationId); if (existing) return quotaSnapshot(current); throw quotaError(quotaSnapshot(current)); }
@@ -58,19 +58,25 @@ export async function reserveTokens(owner, operationId, reservationId, amount = 
 export async function consumeReservedTokens(owner, operationId, reservationId, amount) {
     const requested = asTokens(amount); if (!requested) return getTokenQuota(owner);
     const account = await TokenAccount.findOneAndUpdate(
-        { owner, activeReservations: { $elemMatch: { operationId, reservationId, reservedTokens: { $gte: requested } } } },
+        { owner, activeReservations: { $elemMatch: { operationId, reservationId, reservedTokens: { $gte: requested }, consumptionApplied: false } } },
         [{ $set: {
             reservedTokens: { $subtract: ["$reservedTokens", requested] },
             activeReservations: { $map: { input: "$activeReservations", as: "reservation", in: { $cond: [
                 { $eq: ["$$reservation.reservationId", reservationId] },
-                { $let: { vars: { freeUsed: { $min: [requested, "$$reservation.freeReservedTokens"] } }, in: { $mergeObjects: ["$$reservation", { reservedTokens: { $subtract: ["$$reservation.reservedTokens", requested] }, freeReservedTokens: { $subtract: ["$$reservation.freeReservedTokens", "$$freeUsed"] }, paidReservedTokens: { $subtract: ["$$reservation.paidReservedTokens", { $subtract: [requested, "$$freeUsed"] }] } }] } } },
+                { $let: { vars: { freeUsed: { $min: [requested, "$$reservation.freeReservedTokens"] } }, in: { $mergeObjects: ["$$reservation", { reservedTokens: { $subtract: ["$$reservation.reservedTokens", requested] }, freeReservedTokens: { $subtract: ["$$reservation.freeReservedTokens", "$$freeUsed"] }, paidReservedTokens: { $subtract: ["$$reservation.paidReservedTokens", { $subtract: [requested, "$$freeUsed"] }] }, consumptionApplied: true }] } } },
                 "$$reservation",
             ] } } },
         } },
         { $set: { activeReservations: { $filter: { input: "$activeReservations", as: "reservation", cond: { $gt: ["$$reservation.reservedTokens", 0] } } } } }], { new: true },
     );
-    if (!account) { const current = await ensureAccount(owner); throw quotaError(quotaSnapshot(current), "The provider usage exceeded the token reservation for this AI call."); }
-    return quotaSnapshot(account);
+    if (account) return quotaSnapshot(account);
+
+    // If the reservation still exists, distinguish an actual over-consumption
+    // from a duplicate callback. A finalized reservation is safely idempotent.
+    const current = await ensureAccount(owner);
+    const reservation = current.activeReservations?.find((item) => item.reservationId === reservationId && item.operationId === operationId);
+    if (!reservation || reservation.consumptionApplied) return quotaSnapshot(current);
+    throw quotaError(quotaSnapshot(current), "The provider usage exceeded the token reservation for this AI call.");
 }
 
 export async function releaseReservedTokens(owner, operationId, reservationId) {
