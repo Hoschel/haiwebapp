@@ -39,8 +39,6 @@ function quotaSnapshot(account) {
         freeRemaining: account.freeRemaining,
         paidBalance: account.paidBalance,
         reservedTokens: account.reservedTokens,
-        // Balances are removed from freeRemaining/paidBalance at reservation time,
-        // so reservedTokens must not be subtracted a second time here.
         available: Math.max(0, account.freeRemaining + account.paidBalance),
         freeResetAt: account.freeResetAt,
     };
@@ -61,15 +59,10 @@ export async function reserveTokens(owner, operationId, reservationId, amount = 
     if (!requested || !operationId || !reservationId) throw new Error("Token reservation requires operationId, reservationId and a positive amount");
     const now = new Date();
     await ensureAccount(owner);
-
     const availableExpression = { $add: ["$freeRemaining", "$paidBalance"] };
     const freeTake = { $min: [requested, "$freeRemaining"] };
     const paidTake = { $subtract: [requested, freeTake] };
     const nextFree = { $subtract: ["$freeRemaining", freeTake] };
-
-    // Reservation is an atomic debit from the user's free/paid balances.
-    // The reservation stores exactly which source funded it so a later release
-    // can restore the correct bucket, even if the free quota has since reset.
     const account = await TokenAccount.findOneAndUpdate(
         { owner, "activeReservations.reservationId": { $ne: reservationId }, $expr: { $gte: [availableExpression, requested] } },
         [
@@ -77,19 +70,8 @@ export async function reserveTokens(owner, operationId, reservationId, amount = 
                 freeRemaining: nextFree,
                 paidBalance: { $subtract: ["$paidBalance", paidTake] },
                 reservedTokens: { $add: ["$reservedTokens", requested] },
-                freeResetAt: {
-                    $cond: [
-                        { $and: [{ $gt: ["$freeRemaining", 0] }, { $eq: [nextFree, 0] }] },
-                        new Date(now.getTime() + TOKEN_QUOTA.resetWindowMs),
-                        "$freeResetAt",
-                    ],
-                },
-                activeReservations: {
-                    $concatArrays: [
-                        "$activeReservations",
-                        [{ operationId, reservationId, reservedTokens: requested, freeReservedTokens: freeTake, paidReservedTokens: paidTake, createdAt: now }],
-                    ],
-                },
+                freeResetAt: { $cond: [{ $and: [{ $gt: ["$freeRemaining", 0] }, { $eq: [nextFree, 0] }] }, new Date(now.getTime() + TOKEN_QUOTA.resetWindowMs), "$freeResetAt"] },
+                activeReservations: { $concatArrays: ["$activeReservations", [{ operationId, reservationId, reservedTokens: requested, freeReservedTokens: freeTake, paidReservedTokens: paidTake, freeCycleResetAt: "$freeResetAt", createdAt: now }]] },
             } },
         ],
         { new: true },
@@ -111,19 +93,7 @@ export async function consumeReservedTokens(owner, operationId, reservationId, a
         [
             { $set: {
                 reservedTokens: { $subtract: ["$reservedTokens", requested] },
-                activeReservations: {
-                    $map: {
-                        input: "$activeReservations",
-                        as: "reservation",
-                        in: {
-                            $cond: [
-                                { $eq: ["$$reservation.reservationId", reservationId] },
-                                { $mergeObjects: ["$$reservation", { reservedTokens: { $subtract: ["$$reservation.reservedTokens", requested] } }] },
-                                "$$reservation",
-                            ],
-                        },
-                    },
-                },
+                activeReservations: { $map: { input: "$activeReservations", as: "reservation", in: { $cond: [{ $eq: ["$$reservation.reservationId", reservationId] }, { $mergeObjects: ["$$reservation", { reservedTokens: { $subtract: ["$$reservation.reservedTokens", requested] } }] }, "$$reservation"] } } },
             } },
             { $set: { activeReservations: { $filter: { input: "$activeReservations", as: "reservation", cond: { $gt: ["$$reservation.reservedTokens", 0] } } } } },
         ],
@@ -141,24 +111,9 @@ export async function releaseReservedTokens(owner, operationId, reservationId) {
         { owner, activeReservations: { $elemMatch: { operationId, reservationId } } },
         [
             { $set: {
-                reservedTokens: {
-                    $subtract: [
-                        "$reservedTokens",
-                        { $let: { vars: { reservation: { $arrayElemAt: [{ $filter: { input: "$activeReservations", as: "item", cond: { $and: [{ $eq: ["$$item.operationId", operationId] }, { $eq: ["$$item.reservationId", reservationId] }] } } }, 0] } }, in: "$$reservation.reservedTokens" } },
-                    ],
-                },
-                freeRemaining: {
-                    $add: [
-                        "$freeRemaining",
-                        { $let: { vars: { reservation: { $arrayElemAt: [{ $filter: { input: "$activeReservations", as: "item", cond: { $and: [{ $eq: ["$$item.operationId", operationId] }, { $eq: ["$$item.reservationId", reservationId] }] } } }, 0] } }, in: "$$reservation.freeReservedTokens" } },
-                    ],
-                },
-                paidBalance: {
-                    $add: [
-                        "$paidBalance",
-                        { $let: { vars: { reservation: { $arrayElemAt: [{ $filter: { input: "$activeReservations", as: "item", cond: { $and: [{ $eq: ["$$item.operationId", operationId] }, { $eq: ["$$item.reservationId", reservationId] }] } } }, 0] } }, in: "$$reservation.paidReservedTokens" } },
-                    ],
-                },
+                reservedTokens: { $subtract: ["$reservedTokens", { $let: { vars: { r: { $arrayElemAt: [{ $filter: { input: "$activeReservations", as: "item", cond: { $and: [{ $eq: ["$$item.operationId", operationId] }, { $eq: ["$$item.reservationId", reservationId] }] } } }, 0] } }, in: "$$r.reservedTokens" } }] },
+                freeRemaining: { $add: ["$freeRemaining", { $let: { vars: { r: { $arrayElemAt: [{ $filter: { input: "$activeReservations", as: "item", cond: { $and: [{ $eq: ["$$item.operationId", operationId] }, { $eq: ["$$item.reservationId", reservationId] }] } } }, 0] } }, in: { $cond: [{ $eq: ["$$r.freeCycleResetAt", "$freeResetAt"] }, "$$r.freeReservedTokens", 0] } } }] },
+                paidBalance: { $add: ["$paidBalance", { $let: { vars: { r: { $arrayElemAt: [{ $filter: { input: "$activeReservations", as: "item", cond: { $and: [{ $eq: ["$$item.operationId", operationId] }, { $eq: ["$$item.reservationId", reservationId] }] } } }, 0] } }, in: "$$r.paidReservedTokens" } }] },
                 activeReservations: { $filter: { input: "$activeReservations", as: "reservation", cond: { $not: { $and: [{ $eq: ["$$reservation.operationId", operationId] }, { $eq: ["$$reservation.reservationId", reservationId] }] } } } },
             } },
         ],
