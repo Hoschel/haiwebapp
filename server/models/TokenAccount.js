@@ -2,6 +2,7 @@ import mongoose, { Schema } from "mongoose";
 
 const ReservationSchema = new Schema({
     operationId: { type: String, required: true },
+    reservationId: { type: String, required: true },
     reservedTokens: { type: Number, required: true, min: 0 },
     createdAt: { type: Date, required: true, default: Date.now },
 }, { _id: false });
