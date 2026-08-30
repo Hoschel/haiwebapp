@@ -49,6 +49,9 @@ export function createOperationBudget({ timeoutMs, maxCalls = AI_OPERATION_LIMIT
             usage.outputTokens += outputTokens;
             usage.totalTokens += consumed;
             if (owner && reservationId) {
+                // Usage is consumed from the exact reservation. Any unused part
+                // is immediately released; this prevents reservations from
+                // accumulating across concurrent provider calls.
                 await consumeReservedTokens(owner, tokenOperationId, reservationId, consumed);
                 await releaseReservedTokens(owner, tokenOperationId, reservationId);
             }
