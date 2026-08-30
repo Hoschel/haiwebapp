@@ -83,6 +83,12 @@ export async function consumeReservedTokens(owner, operationId, reservationId, a
                 freeRemaining: { $subtract: ["$freeRemaining", { $min: [requested, "$freeRemaining"] }] },
                 paidBalance: { $subtract: ["$paidBalance", { $max: [0, { $subtract: [requested, "$freeRemaining"] }] }] },
                 reservedTokens: { $subtract: ["$reservedTokens", requested] },
+                freeResetAt: {
+                    $let: {
+                        vars: { nextFree: { $subtract: ["$freeRemaining", { $min: [requested, "$freeRemaining"] }] } },
+                        in: { $cond: [{ $and: [{ $gt: ["$freeRemaining", 0] }, { $eq: ["$$nextFree", 0] }] }, { $dateAdd: { startDate: "$$NOW", unit: "millisecond", amount: TOKEN_QUOTA.resetWindowMs } }, "$freeResetAt"] },
+                    },
+                },
                 activeReservations: { $map: { input: "$activeReservations", as: "reservation", in: { $cond: [{ $eq: ["$$reservation.reservationId", reservationId] }, { $mergeObjects: ["$$reservation", { reservedTokens: { $subtract: ["$$reservation.reservedTokens", requested] } }] }, "$$reservation"] } } },
             } },
             { $set: { activeReservations: { $filter: { input: "$activeReservations", as: "reservation", cond: { $gt: ["$$reservation.reservedTokens", 0] } } } } },
