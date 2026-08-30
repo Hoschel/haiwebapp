@@ -7,6 +7,7 @@ const ReservationSchema = new Schema({
     freeReservedTokens: { type: Number, required: true, default: 0, min: 0 },
     paidReservedTokens: { type: Number, required: true, default: 0, min: 0 },
     freeCycleResetAt: { type: Date, default: null },
+    consumptionApplied: { type: Boolean, required: true, default: false },
     createdAt: { type: Date, required: true, default: Date.now },
 }, { _id: false });
 
