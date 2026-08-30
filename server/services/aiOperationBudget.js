@@ -1,4 +1,5 @@
 import crypto from "crypto";
+import { getRequestContext } from "./requestContext.js";
 import { reserveTokens, consumeReservedTokens, releaseReservedTokens, TOKEN_QUOTA } from "./tokenQuota.js";
 
 const intEnv = (name, fallback, min, max) => {
@@ -16,6 +17,9 @@ export const AI_OPERATION_LIMITS = Object.freeze({
 const asUsageNumber = (value) => Number.isFinite(Number(value)) ? Math.max(0, Number(value)) : 0;
 
 export function createOperationBudget({ timeoutMs, maxCalls = AI_OPERATION_LIMITS.maxProviderCalls, label = "AI operation", userId = null, operationId = null } = {}) {
+    const context = getRequestContext();
+    const owner = userId || context.userId || null;
+    const tokenOperationId = operationId || crypto.randomUUID();
     const startedAt = Date.now();
     const deadline = startedAt + timeoutMs;
     let calls = 0;
@@ -29,9 +33,9 @@ export function createOperationBudget({ timeoutMs, maxCalls = AI_OPERATION_LIMIT
             assertActive();
             calls += 1;
             if (calls > maxCalls) throw Object.assign(new Error(`${label} exceeded its provider-call budget`), { status: 429, code: "AI_OPERATION_CALL_BUDGET_EXCEEDED" });
-            if (userId && operationId) {
+            if (owner) {
                 const reservationId = crypto.randomUUID();
-                await reserveTokens(userId, operationId, reservationId, TOKEN_QUOTA.reservationChunk);
+                await reserveTokens(owner, tokenOperationId, reservationId, TOKEN_QUOTA.reservationChunk);
                 return reservationId;
             }
             return null;
@@ -40,16 +44,17 @@ export function createOperationBudget({ timeoutMs, maxCalls = AI_OPERATION_LIMIT
             const inputTokens = asUsageNumber(rawUsage?.inputTokens ?? rawUsage?.promptTokens);
             const outputTokens = asUsageNumber(rawUsage?.outputTokens ?? rawUsage?.completionTokens);
             const reportedTotal = asUsageNumber(rawUsage?.totalTokens);
+            const consumed = reportedTotal || inputTokens + outputTokens;
             usage.inputTokens += inputTokens;
             usage.outputTokens += outputTokens;
-            usage.totalTokens += reportedTotal || inputTokens + outputTokens;
-            if (userId && operationId && reservationId) {
-                await consumeReservedTokens(userId, operationId, reservationId, usage.totalTokens === 0 ? 0 : (reportedTotal || inputTokens + outputTokens));
-                await releaseReservedTokens(userId, operationId, reservationId);
+            usage.totalTokens += consumed;
+            if (owner && reservationId) {
+                await consumeReservedTokens(owner, tokenOperationId, reservationId, consumed);
+                await releaseReservedTokens(owner, tokenOperationId, reservationId);
             }
         },
         async releaseReservation(reservationId) {
-            if (userId && operationId && reservationId) await releaseReservedTokens(userId, operationId, reservationId);
+            if (owner && reservationId) await releaseReservedTokens(owner, tokenOperationId, reservationId);
         },
         snapshot() { return { startedAt, deadline, calls, maxCalls, timeoutMs, usage: { ...usage } }; },
     };
