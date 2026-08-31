@@ -24,12 +24,18 @@ async function ensureAccount(owner) {
         { upsert: true, new: true, setDefaultsOnInsert: true },
     );
 
-    // The free window starts when the free balance is exhausted. Having a
-    // stale resetAt must never refill a user who still has unused free tokens.
-    if (account.freeRemaining === 0 && account.freeResetAt <= now) {
+    // Every user receives one 1M free-token allowance per cycle. At renewal,
+    // unused free tokens are topped back up to 1M; they never accumulate above it.
+    if (account.freeResetAt <= now) {
+        const resetAt = new Date(now.getTime() + TOKEN_QUOTA.resetWindowMs);
         account = await TokenAccount.findOneAndUpdate(
-            { owner, freeRemaining: 0, freeResetAt: { $lte: now } },
-            { $set: { freeRemaining: account.dailyFreeLimit, freeResetAt: new Date(now.getTime() + TOKEN_QUOTA.resetWindowMs) } },
+            { owner, freeResetAt: { $lte: now } },
+            [
+                { $set: {
+                    freeRemaining: { $max: ["$freeRemaining", "$dailyFreeLimit"] },
+                    freeResetAt: resetAt,
+                } },
+            ],
             { new: true },
         ) || account;
     }
