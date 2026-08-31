@@ -11,7 +11,10 @@ export const TOKEN_QUOTA = Object.freeze({
     resetWindowMs: intEnv("FREE_TOKEN_RESET_WINDOW_MS", 24 * 60 * 60 * 1000, 60_000, 7 * 24 * 60 * 60 * 1000),
 });
 
-const asTokens = (value) => { const number = Number(value); return Number.isFinite(number) ? Math.max(0, Math.floor(number)) : 0; };
+const asTokens = (value) => {
+    const number = Number(value);
+    return Number.isFinite(number) ? Math.max(0, Math.floor(number)) : 0;
+};
 
 async function ensureAccount(owner) {
     const now = new Date();
@@ -20,9 +23,12 @@ async function ensureAccount(owner) {
         { $setOnInsert: { owner, dailyFreeLimit: TOKEN_QUOTA.dailyFreeTokens, freeRemaining: TOKEN_QUOTA.dailyFreeTokens, freeResetAt: new Date(now.getTime() + TOKEN_QUOTA.resetWindowMs) } },
         { upsert: true, new: true, setDefaultsOnInsert: true },
     );
-    if (account.freeResetAt <= now) {
+
+    // The free window starts when the free balance is exhausted. Having a
+    // stale resetAt must never refill a user who still has unused free tokens.
+    if (account.freeRemaining === 0 && account.freeResetAt <= now) {
         account = await TokenAccount.findOneAndUpdate(
-            { owner, freeResetAt: { $lte: now } },
+            { owner, freeRemaining: 0, freeResetAt: { $lte: now } },
             { $set: { freeRemaining: account.dailyFreeLimit, freeResetAt: new Date(now.getTime() + TOKEN_QUOTA.resetWindowMs) } },
             { new: true },
         ) || account;
@@ -70,9 +76,6 @@ export async function consumeReservedTokens(owner, operationId, reservationId, a
         { $set: { activeReservations: { $filter: { input: "$activeReservations", as: "reservation", cond: { $gt: ["$$reservation.reservedTokens", 0] } } } } }], { new: true },
     );
     if (account) return quotaSnapshot(account);
-
-    // If the reservation still exists, distinguish an actual over-consumption
-    // from a duplicate callback. A finalized reservation is safely idempotent.
     const current = await ensureAccount(owner);
     const reservation = current.activeReservations?.find((item) => item.reservationId === reservationId && item.operationId === operationId);
     if (!reservation || reservation.consumptionApplied) return quotaSnapshot(current);
@@ -86,7 +89,7 @@ export async function releaseReservedTokens(owner, operationId, reservationId) {
             reservedTokens: { $subtract: ["$reservedTokens", { $let: { vars: { r: { $arrayElemAt: [{ $filter: { input: "$activeReservations", as: "item", cond: { $and: [{ $eq: ["$$item.operationId", operationId] }, { $eq: ["$$item.reservationId", reservationId] }] } } }, 0] } }, in: "$$r.reservedTokens" } }] },
             freeRemaining: { $add: ["$freeRemaining", { $let: { vars: { r: { $arrayElemAt: [{ $filter: { input: "$activeReservations", as: "item", cond: { $and: [{ $eq: ["$$item.operationId", operationId] }, { $eq: ["$$item.reservationId", reservationId] }] } } }, 0] } }, in: { $cond: [{ $eq: ["$$r.freeCycleResetAt", "$freeResetAt"] }, "$$r.freeReservedTokens", 0] } } }] },
             paidBalance: { $add: ["$paidBalance", { $let: { vars: { r: { $arrayElemAt: [{ $filter: { input: "$activeReservations", as: "item", cond: { $and: [{ $eq: ["$$item.operationId", operationId] }, { $eq: ["$$item.reservationId", reservationId] }] } } }, 0] } }, in: "$$r.paidReservedTokens" } }] },
-            activeReservations: { $filter: { input: "$activeReservations", as: "reservation", cond: { $not: { $and: [{ $eq: ["$$reservation.operationId", operationId] }, { $eq: ["$$reservation.reservationId", reservationId] }] } } } },
+            activeReservations: { $filter: { input: "$activeReservations", as: "reservation", cond: { $not: { $and: [{ $eq: ["$$reservation.operationId", operationId] }, { $eq: ["$$reservation.reservationId", reservationId] }] } } },
         } }], { new: true },
     );
     return account ? quotaSnapshot(account) : getTokenQuota(owner);
