@@ -24,15 +24,19 @@ async function ensureAccount(owner) {
         { upsert: true, new: true, setDefaultsOnInsert: true },
     );
 
-    // Every user receives one 1M free-token allowance per cycle. At renewal,
-    // unused free tokens are topped back up to 1M; they never accumulate above it.
+    // A cycle renewal restores the free allowance to exactly the daily limit.
+    // Unused free tokens are not carried above 1M and paid tokens are untouched.
     if (account.freeResetAt <= now) {
         const resetAt = new Date(now.getTime() + TOKEN_QUOTA.resetWindowMs);
         account = await TokenAccount.findOneAndUpdate(
             { owner, freeResetAt: { $lte: now } },
             [
                 { $set: {
-                    freeRemaining: { $max: ["$freeRemaining", "$dailyFreeLimit"] },
+                    freeRemaining: { $cond: [
+                        { $gte: ["$freeRemaining", "$dailyFreeLimit"] },
+                        "$dailyFreeLimit",
+                        "$dailyFreeLimit",
+                    ] },
                     freeResetAt: resetAt,
                 } },
             ],
@@ -59,7 +63,6 @@ export async function reserveTokens(owner, operationId, reservationId, amount = 
             freeRemaining: nextFree,
             paidBalance: { $subtract: ["$paidBalance", paidTake] },
             reservedTokens: { $add: ["$reservedTokens", requested] },
-            freeResetAt: { $cond: [{ $and: [{ $gt: ["$freeRemaining", 0] }, { $eq: [nextFree, 0] }] }, new Date(now.getTime() + TOKEN_QUOTA.resetWindowMs), "$freeResetAt"] },
             activeReservations: { $concatArrays: ["$activeReservations", [{ operationId, reservationId, reservedTokens: requested, freeReservedTokens: freeTake, paidReservedTokens: paidTake, freeCycleResetAt: "$freeResetAt", consumptionApplied: false, createdAt: now }]] },
         } }], { new: true },
     );
@@ -93,7 +96,7 @@ export async function releaseReservedTokens(owner, operationId, reservationId) {
         { owner, activeReservations: { $elemMatch: { operationId, reservationId } } },
         [{ $set: {
             reservedTokens: { $subtract: ["$reservedTokens", { $let: { vars: { r: { $arrayElemAt: [{ $filter: { input: "$activeReservations", as: "item", cond: { $and: [{ $eq: ["$$item.operationId", operationId] }, { $eq: ["$$item.reservationId", reservationId] }] } } }, 0] } }, in: "$$r.reservedTokens" } }] },
-            freeRemaining: { $add: ["$freeRemaining", { $let: { vars: { r: { $arrayElemAt: [{ $filter: { input: "$activeReservations", as: "item", cond: { $and: [{ $eq: ["$$item.operationId", operationId] }, { $eq: ["$$item.reservationId", reservationId] }] } } }, 0] } }, in: { $cond: [{ $eq: ["$$r.freeCycleResetAt", "$freeResetAt"] }, "$$r.freeReservedTokens", 0] } } }] },
+            freeRemaining: { $min: ["$dailyFreeLimit", { $add: ["$freeRemaining", { $let: { vars: { r: { $arrayElemAt: [{ $filter: { input: "$activeReservations", as: "item", cond: { $and: [{ $eq: ["$$item.operationId", operationId] }, { $eq: ["$$item.reservationId", reservationId] }] } } }, 0] } }, in: { $cond: [{ $eq: ["$$r.freeCycleResetAt", "$freeResetAt"] }, "$$r.freeReservedTokens", 0] } } }] }] },
             paidBalance: { $add: ["$paidBalance", { $let: { vars: { r: { $arrayElemAt: [{ $filter: { input: "$activeReservations", as: "item", cond: { $and: [{ $eq: ["$$item.operationId", operationId] }, { $eq: ["$$item.reservationId", reservationId] }] } } }, 0] } }, in: "$$r.paidReservedTokens" } }] },
             activeReservations: { $filter: { input: "$activeReservations", as: "reservation", cond: { $not: { $and: [{ $eq: ["$$reservation.operationId", operationId] }, { $eq: ["$$reservation.reservationId", reservationId] }] } } },
         } }], { new: true },
