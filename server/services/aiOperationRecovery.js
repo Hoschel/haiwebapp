@@ -45,6 +45,7 @@ export async function recoverStaleAIOperations({ now = new Date() } = {}) {
                 activeReservations: { $filter: { input: "$activeReservations", as: "reservation", cond: { $gte: ["$$reservation.createdAt", cutoff] } } },
             } },
         ],
+        { updatePipeline: true },
     );
 
     return {

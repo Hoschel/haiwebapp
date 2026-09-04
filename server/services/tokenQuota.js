@@ -98,7 +98,7 @@ export async function releaseReservedTokens(owner, operationId, reservationId) {
             reservedTokens: { $subtract: ["$reservedTokens", { $let: { vars: { r: { $arrayElemAt: [{ $filter: { input: "$activeReservations", as: "item", cond: { $and: [{ $eq: ["$$item.operationId", operationId] }, { $eq: ["$$item.reservationId", reservationId] }] } } }, 0] } }, in: "$$r.reservedTokens" } }] },
             freeRemaining: { $min: ["$dailyFreeLimit", { $add: ["$freeRemaining", { $let: { vars: { r: { $arrayElemAt: [{ $filter: { input: "$activeReservations", as: "item", cond: { $and: [{ $eq: ["$$item.operationId", operationId] }, { $eq: ["$$item.reservationId", reservationId] }] } } }, 0] } }, in: { $cond: [{ $eq: ["$$r.freeCycleResetAt", "$freeResetAt"] }, "$$r.freeReservedTokens", 0] } } }] }] },
             paidBalance: { $add: ["$paidBalance", { $let: { vars: { r: { $arrayElemAt: [{ $filter: { input: "$activeReservations", as: "item", cond: { $and: [{ $eq: ["$$item.operationId", operationId] }, { $eq: ["$$item.reservationId", reservationId] }] } } }, 0] } }, in: "$$r.paidReservedTokens" } }] },
-            activeReservations: { $filter: { input: "$activeReservations", as: "reservation", cond: { $not: { $and: [{ $eq: ["$$reservation.operationId", operationId] }, { $eq: ["$$reservation.reservationId", reservationId] }] } } },
+            activeReservations: { $filter: { input: "$activeReservations", as: "reservation", cond: { $not: { $and: [{ $eq: ["$$reservation.operationId", operationId] }, { $eq: ["$$reservation.reservationId", reservationId] }] } } } },
         } }], { new: true },
     );
     return account ? quotaSnapshot(account) : getTokenQuota(owner);

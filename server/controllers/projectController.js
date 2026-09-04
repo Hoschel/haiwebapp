@@ -20,7 +20,7 @@ async function finishAIOperation(operationId, status, snapshot, error = null) {
 }
 
 async function updateGeneratedFile(projectId, operationId, path, code, retries = 5) { for (let attempt = 0; attempt < retries; attempt += 1) { const project = await Project.findOne({ _id: projectId, generationOperationId: operationId, status: "generating" }); if (!project) return; const normalizedPath = normalizePath(path); project.files = project.files || {}; project.files[normalizedPath] = { content: code, hash: hashContent(code) }; project.filesGenerated = [...new Set([...(project.filesGenerated || []), normalizedPath])]; project.messages.push({ role: "assistant", content: `Created file \"${normalizedPath}\"`, timestamp: new Date() }); project.currentFile = null; try { await project.save(); return; } catch (error) { if (error?.name !== "VersionError" || attempt === retries - 1) throw error; } } }
-async function setGenerationStage(projectId, operationId, stage, extra = {}) { await Project.findOneAndUpdate({ _id: projectId, generationOperationId: operationId, status: "generating" }, { $set: { generationStage: stage, ...extra }); }
+async function setGenerationStage(projectId, operationId, stage, extra = {}) { await Project.findOneAndUpdate({ _id: projectId, generationOperationId: operationId, status: "generating" }, { $set: { generationStage: stage, ...extra } }); }
 
 export async function createProject(req, res) { const { prompt } = req.body; if (!prompt || typeof prompt !== "string" || !prompt.trim()) return res.status(400).json({ error: "prompt is required" }); if (!req.user) return res.status(401).json({ error: "Unauthorized" }); const cleanPrompt = prompt.trim(); const operationId = crypto.randomUUID(); const project = await Project.create({ name: "Planning project...", description: cleanPrompt, files: {}, messages: [{ role: "user", content: cleanPrompt }, { role: "assistant", content: "Planning project structure..." }], owner: req.user.userId, status: "pending", generationStage: "planning", generationOperationId: operationId }); await startAIOperation({ owner: req.user.userId, project: project._id, operationId, type: "generation" }); runBackgroundGeneration(project._id.toString(), cleanPrompt, operationId).catch((err) => console.error(`[Background AI] Fatal generation error for ${project._id}:`, err)); return res.status(201).json(projectResponse(project)); }
 
@@ -37,6 +37,25 @@ async function runBackgroundGeneration(projectId, prompt, operationId) {
 export async function listProjects(req, res) { if (!req.user) return res.status(401).json({ error: "Unauthorized" }); return res.json(await Project.find({ owner: req.user.userId }, { name: 1, description: 1, version: 1, status: 1, generationStage: 1, published: 1, createdAt: 1, updatedAt: 1 }).sort({ updatedAt: -1 })); }
 export async function getProject(req, res) { if (!req.user) return res.status(401).json({ error: "Unauthorized" }); const project = await Project.findOne({ _id: req.params.id, owner: req.user.userId }); if (!project) return res.status(404).json({ error: "Project not found" }); return res.json(projectResponse(project)); }
 export async function deleteProject(req, res) { if (!req.user) return res.status(401).json({ error: "Unauthorized" }); const result = await Project.findOneAndDelete({ _id: req.params.id, owner: req.user.userId }); if (!result) return res.status(404).json({ error: "Project not found" }); return res.json({ success: true }); }
+
+export async function getPublicProject(req, res) {
+    const project = await Project.findOne({ _id: req.params.id, published: true }, { files: 1, name: 1, description: 1, version: 1, published: 1, verification: 1 });
+    if (!project) return res.status(404).json({ error: "This website is not available or is not published yet." });
+    return res.json({ _id: project._id, name: project.name, description: project.description, version: project.version, files: serializeFiles(project.files), published: project.published, verification: project.verification });
+}
+
+export async function publishProject(req, res) {
+    if (!req.user) return res.status(401).json({ error: "Unauthorized" });
+    const project = await Project.findOne({ _id: req.params.id, owner: req.user.userId });
+    if (!project) return res.status(404).json({ error: "Project not found" });
+    if (project.status !== "completed") return res.status(409).json({ error: "Project is not ready to publish yet." });
+    if (project.verification?.status !== "verified") return res.status(409).json({ error: "Project verification is not complete yet." });
+    if (project.published) return res.json({ success: true, published: true, project: projectResponse(project) });
+
+    project.published = true;
+    await project.save();
+    return res.json({ success: true, published: true, project: projectResponse(project) });
+}
 
 export async function updateProjectFiles(req, res) { const { files, version } = req.body; if (!files || typeof files !== "object" || Array.isArray(files)) return res.status(400).json({ error: "files object is required" }); if (!Number.isInteger(version) || version < 0) return res.status(400).json({ error: "A valid project version is required" }); if (!req.user) return res.status(401).json({ error: "Unauthorized" }); const newFiles = {}; for (const [path, content] of Object.entries(files)) if (typeof content === "string" && path.startsWith("/")) newFiles[path] = { content, hash: hashContent(content) }; const nextVersion = version + 1; const verification = pendingVerification(newFiles, nextVersion); const project = await Project.findOneAndUpdate({ _id: req.params.id, owner: req.user.userId, version, status: { $nin: ["generating", "revising"] } }, { $set: { files: newFiles, verification }, $inc: { version: 1 } }, { new: true, runValidators: true }); if (!project) { const exists = await Project.exists({ _id: req.params.id, owner: req.user.userId }); if (!exists) return res.status(404).json({ error: "Project not found" }); const latest = await Project.findOne({ _id: req.params.id, owner: req.user.userId }); return res.status(409).json({ error: "Project is busy or was updated elsewhere. Wait for the current operation or reload before saving again.", project: latest ? projectResponse(latest) : undefined }); } return res.json(projectResponse(project)); }
 
